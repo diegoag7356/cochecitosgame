@@ -7,6 +7,19 @@ import { MiniMap } from './minimap.js';
 import { Race } from './race.js';
 import { initMenus, screens } from './menu.js';
 import { GameAudio } from './audio.js';
+import { Faults, setFaultListener } from './faults.js';
+import { setPlayerGhost, isPlayerGhost } from './race.js';
+import { Multiplayer } from './mp.js';
+import { setMultiplayer } from './menu.js';
+
+// ---- Multijugador (Firebase Realtime Database) ----
+const MP = new Multiplayer((room) => {
+  if (window.__renderMpRoom) window.__renderMpRoom(room);
+  if (room && room.meta && room.meta.status === 'racing' && session && session.mode === 'mp') {
+    // El estado de carrera MP lo gestiona el flujo normal de race mode
+  }
+});
+setMultiplayer(MP);
 
 const OVERLAY = document.getElementById('overlay');
 const HUD_SPEED = document.getElementById('hud-speed');
@@ -27,7 +40,8 @@ const HUD_DRIVER = document.getElementById('hud-driver');
 const HUD_LAPCOUNT = document.getElementById('hud-lapcount');
 const RACE_STATE = document.getElementById('race-state');
 const BOARD_ROWS = document.getElementById('board-rows');
-const BLUE_FLAG = document.getElementById('blue-flag');
+const FAULT_BANNER = document.getElementById('fault-banner');
+const GHOST_VIGNETTE = document.getElementById('ghost-vignette');
 const SECTOR_FLASH = document.getElementById('sector-flash');
 const SECTOR_NAME = document.getElementById('sector-name');
 const SECTOR_TIME = document.getElementById('sector-time');
@@ -40,6 +54,7 @@ const SCALE = 0.02; // unidades obj -> mundo
 
 let playing = false;
 let paused = false;
+let FAULTS = null; // sistema de faltas (solo modo carrera)
 
 // ---- Audio procedural (WebAudio, sin ficheros) ----
 const AUDIO = new GameAudio();
@@ -304,9 +319,9 @@ const P = {
   mass: 798,
   wheelbase: 2.0,
   powerW: 560000,
-  drsDragMul: 0.82,
-  drsPush: 6000,
-  drsPushV: 84,
+  drsDragMul: 0.72,
+  drsPush: 9000,
+  drsPushV: 88,
   tractionCap: 14000,
   brakeBase: 46,
   brakeQ: 0.004,
@@ -323,6 +338,9 @@ const P = {
   CdA: 1.56,
   rho: 1.225,
 };
+// Velocidades tope: el drag natural hace que ~300 (sin DRS) y ~330 (con DRS)
+// cuesten muchísimo subir — sin límite duro artificial.
+const V_HARD_CAP = 340 / 3.6;
 const drag = (v) => 0.5 * P.rho * P.CdA * v * v;
 
 const drive = {
@@ -347,6 +365,7 @@ window.addEventListener('keydown', (e) => {
   if (!playing || paused) return;
   if (e.code === 'KeyC') { e.preventDefault(); cycleCamera(); return; }
   if (e.code === 'KeyR') { e.preventDefault(); restartSession(); return; }
+  if (e.code === 'KeyT') { e.preventDefault(); recoverToTrack(); return; }
   if (e.code === 'Space') {
     e.preventDefault();
     tryOpenDrs();
@@ -357,18 +376,68 @@ window.addEventListener('keydown', (e) => {
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Enter') {
     e.preventDefault();
-    if (session && session.mode === 'race') {
-      gapDisplay = gapDisplay === 'leader' ? 'ahead' : 'leader';
-    }
+    // ENTER alterna el modo de intervalos (ahora: siempre vs delante)
+    gapDisplay = gapDisplay === 'ahead' ? 'leader' : 'ahead';
   }
 });
-let gapDisplay = 'leader'; // 'leader' | 'ahead': qué intervalos muestra el leaderboard
+let gapDisplay = 'ahead'; // intervalos del leaderboard: por defecto VS DELANTERO
 window.addEventListener('keyup', (e) => keys.delete(e.code));
 window.addEventListener('blur', () => { if (!window.__f1KeepKeys) keys.clear(); });
 
 const steerInput = () => (keys.has('ArrowLeft') ? 1 : 0) - (keys.has('ArrowRight') ? 1 : 0);
 const throttleInput = () => keys.has('KeyW');
 const brakeInput = () => keys.has('KeyS');
+
+// Recuperación: T lleva el coche de vuelta a la carretera en el punto del
+// eje MÁS CERCANO que no esté justo antes de una curva (busca hacia delante
+// en el arco un tramo con radio generoso) y activa 5 s de fantasma.
+let recoverHold = 0;
+function recoverToTrack() {
+  if (!playing || !carReady) return;
+  const n = track.centers.length;
+  const u0 = track.arcOf(drive.pos.x, drive.pos.z);
+  const idx0 = Math.round(u0 * n) % n;
+  // Busca hacia delante un punto con radio de curvatura holgado (recta)
+  let best = -1, bestR = 0;
+  for (let k = 0; k < n / 3; k++) {
+    const i = (idx0 + k) % n;
+    const R = track._radii[i] || 999;
+    if (R > 80 && best < 0) { best = i; bestR = R; }
+  }
+  if (best < 0) best = (idx0 + Math.round(n * 0.05)) % n;
+  const p = track.posAtArc(best / n, 0);
+  const ahead = track.posAtArc(((best + 3) % n) / n, 0);
+  drive.pos.set(p.x, 0, p.z);
+  drive.heading = Math.atan2(-(ahead.x - p.x), -(ahead.z - p.z));
+  drive.vx = Math.min(drive.vx, 15);
+  drive.spinOmega = 0;
+  drive.steer = 0;
+  setPlayerGhost(5);
+  camShake = 0;
+  AUDIO.shiftGear();
+}
+
+// Gestión del mantenimiento de T (1 s) y del parpadeo del fantasma
+let recoverCd = 0;
+function updateRecover(dt) {
+  if (recoverCd > 0) recoverCd -= dt;
+  const tHeld = keys.has('KeyT');
+  if (tHeld && playing && !paused && recoverCd <= 0) {
+    recoverHold += dt;
+    if (recoverHold >= 1) { recoverHold = 0; recoverCd = 2; recoverToTrack(); }
+  } else if (!tHeld) {
+    recoverHold = 0;
+  }
+  const ghost = isPlayerGhost();
+  if (GHOST_VIGNETTE) GHOST_VIGNETTE.classList.toggle('on', ghost);
+  if (car) car.visible = !ghost || (Math.floor(performance.now() / 120) % 2 === 0);
+  const rb = document.getElementById('recover-bar');
+  if (rb) {
+    rb.classList.toggle('on', recoverHold > 0);
+    const fill = document.getElementById('rb-fill');
+    if (fill) fill.style.width = Math.min(100, (recoverHold / 1) * 100) + '%';
+  }
+}
 
 // ============================================================
 // Sesiones: free | timetrial | race
@@ -388,12 +457,37 @@ function defaultSession(mode) {
     finished: false,
     finishTime: null,
     disqualified: false,
+    jumpStartDone: false,
     best: null,
     last: null,
     t0: 0,
     clockOn: false,    // el reloj de sesión corre desde el inicio (false solo en parrilla)
     running: false,
   };
+}
+
+// Arranque de sesión MP (vuelta de reconocimiento) desde el lobby
+window.__mpStartRecon = (room) => {
+  if (session && session.mode === 'mp' && playing) return; // ya en marcha
+  const ps = MP.playersSorted();
+  const me = ps.find((p) => p.id === MP_PID) || ps[0];
+  startSessionInternal({
+    mode: 'mp',
+    playerName: me ? me.name : 'PILOTO',
+    playerColor: me ? me.color : '#e10600',
+    laps: (room.meta && room.meta.laps) || 5,
+    mp: { room: MP.roomId, players: ps },
+  });
+};
+
+function startSessionInternal(cfg) {
+  session = Object.assign(defaultSession(cfg.mode), cfg);
+  if (cfg.mode === 'mp') {
+    session.drsEnabled = true;
+    session.drsRule = 'free';
+    session.countdown = true;
+  }
+  beginSession();
 }
 
 initMenus({
@@ -423,7 +517,6 @@ function beginSession() {
   document.body.classList.remove('leaderboard');
   OVERLAY.classList.add('hidden');
   keys.clear();
-  BLUE_FLAG.classList.remove('on');
 
   if (race) { race.dispose(); race = null; }
   paused = false;
@@ -440,13 +533,12 @@ function beginSession() {
   HUD_DRIVER.textContent = session.playerName;
 
   applyHudMode();
-  // La sesión SIEMPRE arranca en cámara del coche (persecución): el jugador
-  // puede cambiarla con C cuando quiera.
-  cameraMode = 'chase';
-  camera.fov = CAM_FOV.chase;
+  // Solo hay UNA cámara: morro (con T-Cam/retrovisor integrada)
+  cameraMode = 'nose';
+  camera.fov = CAM_FOV.nose;
   camera.updateProjectionMatrix();
-  document.body.classList.remove('nose-cam');
-  HUD_MODE.textContent = 'cámara: persecución';
+  document.body.classList.add('nose-cam');
+  HUD_MODE.textContent = 'cámara: morro';
 
   placeAtStart();
 
@@ -461,11 +553,26 @@ function beginSession() {
   timer.last = null;
   // El reloj corre desde el inicio de la sesión, EXCEPTO en carrera: allí
   // empieza exactamente al apagarse las luces (updateRaceFlow).
-  timer.running = session.mode !== 'race';
+  timer.running = session.mode !== 'race' && session.mode !== 'mp';
   timer.t0 = performance.now();
   timer.prevSide = 0;
-  lapDoneCount = 0;
-  if (session.mode === 'race') {
+  lapDoneCount = 0;    if (session.mode === 'mp') {
+      // ---- MULTIJUGADOR: 3-2-1 SALIDA + vuelta de reconocimiento ----
+      session.t0 = performance.now();
+      session.clockOn = false;         // sin reloj en la vuelta de reconocimiento
+      session.best = null; session.last = null;
+      lapCounter.laps = 0;
+      session.reconPhase = 'count';
+      session.reconT = 3.2;            // cuenta atrás 3-2-1
+      session.reconDone = false;
+      session.lapInvalid = false;
+      session.mpGridAssigned = -1;
+      RACE_STATE.className = 'blue';
+      RACE_STATE.textContent = '3';
+      AUDIO.countdown();
+      FAULTS = new Faults(session, track);
+      FAULTS.enabled = false;          // en la vuelta de reconocimiento no hay faltas
+    } else if (session.mode === 'race') {
     // El reloj NO arranca en la parrilla: empieza exactamente al apagarse
     // las luces (updateRaceFlow se encarga).
     session.t0 = performance.now();
@@ -479,6 +586,8 @@ function beginSession() {
       playerBodyGeo,
     });
     race.totalLaps = session.laps;
+    FAULTS = new Faults(session, track);
+    race.faults = FAULTS; // las colisiones sancionan a través del sistema de faltas
     race.onPlayerHit = (impact) => {
       playerDmg = Math.min(1, playerDmg + impact * 0.4);
       camShake = Math.min(0.9, camShake + impact * 0.8);
@@ -583,7 +692,30 @@ function updateLapTimer() {
   const bwd = ((prev - prog) % 1 + 1) % 1; // retroceso
   const inf = track.info(drive.pos.x, drive.pos.z);
   const onRoad = Math.abs(inf.lat) < track.roadHalf + track.kerbW + 2;
-  const racing = session.mode !== 'free' && (!race || race.phase === 'green') && !session.disqualified;
+  const racing = (session.mode === 'race' || session.mode === 'mp')
+    && (!race || race.phase === 'green') && !session.disqualified;
+  // Vueltas de la vuelta de reconocimiento MP: la 1ª cruce cierra la vuelta
+  // clasificatoria y te asigna hueco de parrilla según orden de llegada.
+  if (session.mode === 'mp' && session.reconPhase === 'run' && fwd < 0.5 && prog < prev) {
+    session.mpGridAssigned = session.mpGridAssigned < 0 ? mpGridCounter++ : session.mpGridAssigned;
+    RACE_STATE.textContent = 'Sales en la Posición ' + (session.mpGridAssigned + 1);
+    RACE_STATE.className = 'yellow';
+    setStatusGrid(session.mpGridAssigned);
+    if (session.mpGridAssigned >= MP.playersSorted().length - 1) {
+      // Último en llegar: todos a parrilla → semáforo
+      session.reconPhase = 'grid';
+      session.gridWait = 3;
+      startRaceLights();
+    }
+  }
+  // Cuenta atrás 3-2-1 del reconocimiento
+  if (session.mode === 'mp' && session.reconPhase === 'count') {
+    session.reconT -= (now - session.t0) / 1000;
+    session.t0 = now;
+    const n = Math.ceil(session.reconT);
+    RACE_STATE.textContent = n > 0 ? String(n) : '¡SALIDA!';
+    if (session.reconT <= 0) { session.reconPhase = 'run'; session.clockOn = true; timer.t0 = now; }
+  }
   lastLapProg = prog;
 
   // ---- Sectores FÍSICOS: marcas a 1/3 y 2/3 de vuelta, solo hacia delante ----
@@ -678,6 +810,113 @@ function sectorComplete(n, now) {
 }
 let lapDoneCount = 0; // vueltas válidas completadas (cronometraje)
 const ttLaps = [];    // tiempos de cada vuelta válida
+
+// ---- Multijugador en pista ----
+let mpGridCounter = 0; // orden de llegada a la línea amarilla
+async function setStatusGrid(slot) {
+  try { await MP.setGridSlot(slot); } catch (_) {}
+}
+// Semáforo MP: máquina de estados propia (independiente del Race local)
+let mpLights = null;
+function startRaceLights() {
+  document.getElementById('lights-screen').classList.remove('receding');
+  document.querySelectorAll('#lights-gantry .bulb').forEach((b) => b.classList.remove('on'));
+  showLights(true);
+  if (MP.isHost) MP.setStatus('racing');
+  mpLights = { t: 0, lights: 0, holdT: 0, out: false, outT: 0, beeped: 0 };
+}
+function updateMpLights(dt) {
+  if (!mpLights || !session) return;
+  const cols = document.querySelectorAll('#lights-gantry .light-col');
+  if (!mpLights.out) {
+    mpLights.t += dt;
+    const want = Math.min(5, Math.floor(mpLights.t) + (mpLights.t > 0.5 ? 1 : 0));
+    if (want > mpLights.lights) {
+      mpLights.lights = want;
+      AUDIO.lightBeep();
+      cols.forEach((col, ci) => { const b = col.querySelector('.bulb'); if (b) b.classList.toggle('on', mpLights.lights > ci); });
+    }
+    if (mpLights.lights >= 5) {
+      if (mpLights.holdT === 0) mpLights.holdT = 3 + Math.random() * 2;
+      mpLights.holdT -= dt;
+      if (mpLights.holdT <= 0) {
+        // ¡LUCES FUERA!
+        mpLights.out = true;
+        AUDIO.lightsGo();
+        RACE_STATE.textContent = '¡LUCES FUERA!';
+        RACE_STATE.className = 'green';
+        setTimeout(() => { if (RACE_STATE.textContent === '¡LUCES FUERA!') RACE_STATE.textContent = ''; }, 1500);
+        session.clockOn = true;
+        timer.t0 = performance.now();
+        lapCounter.armed = false;
+        lapCounter.laps = 0;
+      }
+    }
+    // Salto en falso MP: +20 s (no DSQ)
+    if (!session.jumpStartDone && Math.abs(drive.vx) > 0.5 && mpLights.lights > 0) {
+      session.jumpStartDone = true;
+      if (FAULTS) FAULTS.jumpStart();
+    }
+  } else {
+    // El gantry se queda 3 s tras el apagado y sale con la misma animación
+    mpLights.outT += dt;
+    if (mpLights.outT >= 3) {
+      document.getElementById('lights-screen').classList.add('receding');
+      setTimeout(() => { showLights(false); document.getElementById('lights-screen').classList.remove('receding'); }, 900);
+      mpLights = null;
+    }
+  }
+}
+
+// Publica mi posición (10 Hz) y dibuja los coches de los otros jugadores
+let mpPubT = 0;
+const mpMeshes = new Map(); // pid -> THREE.Group
+function updateMpRemote(dt) {
+  if (!session || session.mode !== 'mp' || !MP.room) return;
+  mpPubT -= dt;
+  if (mpPubT <= 0) {
+    mpPubT = 0.1;
+    MP.publishState(drive.pos.x, drive.pos.z, drive.heading, drive.vx);
+  }
+  const seen = new Set();
+  for (const p of MP.playersSorted()) {
+    if (p.id === MP_PID || p.x == null) continue;
+    seen.add(p.id);
+    let g = mpMeshes.get(p.id);
+    if (!g) {
+      g = new THREE.Group();
+      if (playerBodyGeo) {
+        const m = new THREE.MeshStandardMaterial({ vertexColors: true, color: new THREE.Color(p.color), roughness: 0.36, metalness: 0.18 });
+        const mesh = new THREE.Mesh(playerBodyGeo, m);
+        mesh.castShadow = true;
+        g.add(mesh);
+      }
+      scene.add(g);
+      mpMeshes.set(p.id, g);
+    }
+    g.position.set(p.x, 0, p.z);
+    g.rotation.y = p.heading || 0;
+  }
+  for (const [idg, g] of mpMeshes) {
+    if (!seen.has(idg)) { scene.remove(g); mpMeshes.delete(idg); }
+  }
+}
+// Línea amarilla de clasificación MP: dibujada a 40 m de la parrilla (antes
+// de la meta) cruzando todo el asfalto.
+function buildMpYellowLine() {
+  const p = track.startPos, tg = track.startTangent;
+  const nlx = -tg.z, nlz = tg.x;
+  const back = 8 + 8 * 8 + 20; // detrás de los 8 huecos + margen
+  const x1 = p.x - tg.x * back - nlx * (track.roadHalf + 1);
+  const z1 = p.z - tg.z * back - nlz * (track.roadHalf + 1);
+  const x2 = p.x - tg.x * back + nlx * (track.roadHalf + 1);
+  const z2 = p.z - tg.z * back + nlz * (track.roadHalf + 1);
+  const g = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(x1, 0.03, z1), new THREE.Vector3(x2, 0.03, z2),
+  ]);
+  track.scene.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0xffd400 })));
+}
+buildMpYellowLine();
 let sectorStart = 0, currentSector = 1, sectorFlashTO = null;
 let sectorDone = {};
 
@@ -689,6 +928,18 @@ function placeAtStart() {
   if (session && session.mode === 'race' && race) {
     pos = race.playerStart.pos; heading = race.playerStart.heading;
   }
+  // MP: salida en la LÍNEA DE META (no parrilla) escalonados por orden de unión
+  if (session && session.mode === 'mp') {
+    const tg = track.startTangent;
+    const nlx = -tg.z, nlz = tg.x;
+    const k = (session.mpSlot || 0);
+    pos = new THREE.Vector3(
+      track.startPos.x - tg.x * 10 - nlx * (k % 2 === 0 ? 3.4 : -3.4) * Math.floor(k / 2),
+      0,
+      track.startPos.z - tg.z * 10 - nlz * (k % 2 === 0 ? 3.4 : -3.4) * Math.floor(k / 2)
+    );
+    heading = track.startHeading;
+  }
   drive.pos.copy(pos);
   drive.heading = heading;
   drive.vx = drive.steer = drive.omega = 0;
@@ -699,6 +950,7 @@ function placeAtStart() {
   camShake = 0;
   resultsShown = false;
   _lapState.prevProg = null;
+  if (drive) drive.spinOmega = 0;
   car.position.copy(drive.pos);
   car.rotation.y = drive.heading;
   timer.running = false;
@@ -711,18 +963,11 @@ function placeAtStart() {
   session && (session.finished = false, session.finishTime = null, session.disqualified = false);
 }
 
-const CAM_MODES = ['chase', 'nose'];
-const CAM_FOV = { chase: 62, nose: 74 };
-let cameraMode = 'chase';
+const CAM_MODES = ['nose'];
+const CAM_FOV = { nose: 74 };
+let cameraMode = 'nose';
 function cycleCamera() {
-  cameraMode = CAM_MODES[(CAM_MODES.indexOf(cameraMode) + 1) % CAM_MODES.length];
-  camera.fov = CAM_FOV[cameraMode];
-  camera.updateProjectionMatrix();
-  document.body.classList.toggle('nose-cam', cameraMode === 'nose');
-  HUD_MODE.textContent = {
-    chase: 'cámara: persecución',
-    nose: 'cámara: morro',
-  }[cameraMode];
+  // Solo existe la cámara morro (la T-Cam hace de retrovisor)
 }
 
 // ============================================================
@@ -774,7 +1019,9 @@ function physicsStep(dt) {
   st.vx = v + a * dt;
   if (v > 0 && st.vx < 0 && !braking) st.vx = 0;
   if (v < 0 && st.vx > 0 && !throttleInput()) st.vx = 0;
-  st.vx = THREE.MathUtils.clamp(st.vx, -P.reverseMax, 95 * (1 - playerDmg * 0.07));
+  // Sin límite duro a 300: el drag natural hace que cueste muchísimo subir
+  // de ahí (y con DRS, de 330). Cap duro solo como red de seguridad física.
+  st.vx = THREE.MathUtils.clamp(st.vx, -P.reverseMax, V_HARD_CAP);
 
   const inZone = track.isDrsZone(st.pos.x, st.pos.z);
   if (inZone && !drsZonePrev) st.drsUsed = false;
@@ -787,6 +1034,12 @@ function physicsStep(dt) {
   const maxLat = (P.latBase + P.latQ * vAbs * vAbs) * grip;
   const gripOmega = (Math.sign(steerOmega) * maxLat) / Math.max(vAbs, 0.1);
   st.omega = Math.abs(steerOmega) > Math.abs(gripOmega) ? gripOmega : steerOmega;
+  // TROMPO: los impactos añaden rotación extra que se disipa en ~1 s
+  if (st.spinOmega) {
+    st.omega += st.spinOmega;
+    st.spinOmega *= Math.exp(-3 * dt);
+    if (Math.abs(st.spinOmega) < 0.02) st.spinOmega = 0;
+  }
 
   st.heading += st.omega * dt;
   const fwdX = -Math.sin(st.heading), fwdZ = -Math.cos(st.heading);
@@ -794,12 +1047,21 @@ function physicsStep(dt) {
   st.pos.z += fwdZ * st.vx * dt;
 
   st.aLat = Math.abs(st.omega * st.vx) / 9.81;
+  // Faltas: atajos (4 ruedas fuera con ganancia de progreso)
+  if (FAULTS && session && session.mode === 'race') {
+    FAULTS.trackCut(st.pos.x, st.pos.z, offTrack && !inSand, vAbs, performance.now());
+  }
 }
 
 function updateWheels(dt) {
   const delta = drive.steer * P.maxSteer * Math.exp(-Math.abs(drive.vx) / P.steerFadeV);
   for (const w of wheels) {
-    w.spin -= (drive.vx / w.R) * dt;
+    // A alta velocidad la rotación real "aliasa" (parece quieta o al revés).
+    // Limito la velocidad VISUAL para que siempre se note que giran.
+    const phys = drive.vx / w.R;
+    const aPhys = Math.abs(phys);
+    const vis = aPhys > 16 ? Math.sign(phys) * (16 + (aPhys - 16) * 0.08) : phys;
+    w.spin -= vis * dt;
     w.mesh.rotation.x = w.spin;
     if (w.front) w.mesh.rotation.y = delta;
   }
@@ -887,10 +1149,12 @@ const HUD_LEDS = [];
   }
 })();
 
-const GEAR_TOPS = [95 / 3.6, 145 / 3.6, 195 / 3.6, 245 / 3.6, 290 / 3.6, 330 / 3.6];
+// 7 marchas: cortes algo antes para que la 6 domine la mayor parte del uso;
+// la 7a aparece por encima de 330 (solo alcanzable con DRS).
+const GEAR_TOPS = [88 / 3.6, 133 / 3.6, 178 / 3.6, 224 / 3.6, 270 / 3.6, 330 / 3.6, 340 / 3.6];
 function gearOf(vAbs) {
   for (let i = 0; i < GEAR_TOPS.length; i++) if (vAbs <= GEAR_TOPS[i]) return i + 1;
-  return 6;
+  return 7;
 }
 
 let lastKmh = -1;
@@ -910,7 +1174,7 @@ function updateHUD() {
   }
   // Guardamos la fracción de marcha para el motor de audio (tick la usa)
 
-  const gi = Math.min(5, Math.max(0, gearOf(vAbs) - 1));
+  const gi = Math.min(6, Math.max(0, gearOf(vAbs) - 1));
   const lo = gi === 0 ? 0 : GEAR_TOPS[gi - 1];
   const hi = GEAR_TOPS[gi];
   const frac = hi > lo ? (vAbs - lo) / (hi - lo) : 0;
@@ -922,7 +1186,7 @@ function updateHUD() {
     }
   }
 
-  HUD_REV.style.width = Math.min(100, (kmh / 330) * 100) + '%';
+  HUD_REV.style.width = Math.min(100, (kmh / 340) * 100) + '%';
 
   const surf = drive.surface;
   HUD_SURF.textContent = surf === 'asphalt' ? 'ASFALTO' : (surf === 'sand' ? 'ARENA' : 'HIERBA');
@@ -1003,53 +1267,38 @@ function updateHUD() {
     race.updatePlayerProgress(drive.pos.x, drive.pos.z);
     // Bots que terminan sus vueltas
     for (const b of race.bots) {
-      if (b.finishTime == null && b.lap >= session.laps + 1) b.finishTime = performance.now();
+      if (b.finishTime == null && b.lap >= session.laps) b.finishTime = performance.now(); // lap cuenta vueltas COMPLETADAS
     }
     updateBoard();
-    // Bandera azul: un bot con vuelta ventaja está a punto de doblarme
-    // (distancia HACIA DELANTE desde el jugador hasta el bot)
-    const pU = race.playerProgress.u;
-    const blue = race.bots.some((b) => b.lap >= lapCounter.laps + 1 && track.lapDist(pU, b.u) < 220);
-    BLUE_FLAG.classList.toggle('on', blue && !session.finished && !session.disqualified);
-  } else {
-    BLUE_FLAG.classList.remove('on');
   }
 
   minimap.update(drive.pos.x, drive.pos.z, drive.heading, rivals);
 }
 
 // ---- Leaderboard en vivo ----
-// gapDisplay: 'leader' = distancia con el líder (por defecto), 'ahead' = con el
-// piloto de delante. Se cambia con ENTER.
+// Intervalos SIEMPRE contra el piloto de ENDELANTE (cuánto te saca / le sacas).
+// ENTER alterna el sentido de la comparación (tiempo medio ↔ tiempo instantáneo).
 let lastBoardHTML = '';
 function updateBoard() {
   if (!race || !session) return;
   const rows = race.liveStandings(session.playerName, session.playerColor, session.finished && session.finishTime != null, lapCounter.laps);
   race.lastStandings = rows;
   const myIdx = rows.findIndex((r) => r.isPlayer);
-  const leader = rows[0];
-  if (BOARD_MODE) BOARD_MODE.textContent = gapDisplay === 'leader' ? 'VS LÍDER' : 'VS DELANTERO';
+  if (BOARD_MODE) BOARD_MODE.textContent = gapDisplay === 'ahead' ? 'VS DELANTERO' : 'VS LÍDER';
   let html = '';
   const show = Math.min(rows.length, 8);
   for (let i = 0; i < show; i++) {
     const r = rows[i];
-    let gapTxt = 'LÍDER';
+    let gapTxt = '—';
     if (i > 0) {
-      if (r.finishTime != null && leader.finishTime != null) {
-        gapTxt = '+' + ((r.finishTime - leader.finishTime) / 1000).toFixed(1);
-      } else {
-        let refRow, sign;
-        if (gapDisplay === 'leader') { refRow = leader; sign = '+'; }
-        else {
-          const k = Math.max(0, i - 1);
-          refRow = rows[k];
-          sign = i > k ? '+' : '-';
-        }
-        const dist = track.lapDist(refRow.prog, r.prog); // distancia hacia atrás
-        gapTxt = sign + (dist / 80).toFixed(1) + 's';
+      // GAP EN SEGUNDOS: distancia HACIA DELANTE desde esta fila hasta la de
+      // delante (cuánto te saca), a ritmo de 80 m/s.
+      const refRow = gapDisplay === 'ahead' ? rows[i - 1] : rows[0];
+      const dist = track.lapDist(r.prog, refRow.prog); // distancia hacia adelante r→ref
+      gapTxt = (dist / 80).toFixed(1) + 's';
+      if (r.finishTime != null && refRow.finishTime != null) {
+        gapTxt = '+' + ((r.finishTime - refRow.finishTime) / 1000).toFixed(1);
       }
-    } else if (r.finishTime != null) {
-      gapTxt = 'META';
     }
     const me = r.isPlayer ? ' me' : '';
     html += '<div class="b-row' + me + '">'
@@ -1095,30 +1344,31 @@ function updateRaceFlow(dt) {
       POS_BIG_L.textContent = 'DE 8';
       POS_BIG_P.parentElement.classList.add('on');
     }
-    // Salto en falso: cualquier movimiento antes del apagado se castiga AL INSTANTE
-    if (!session.disqualified && Math.abs(drive.vx) > 0.5) {
+    // Salto en falso: no descalifica, suma +20 s al tiempo global
+    if (!session.jumpStartDone && Math.abs(drive.vx) > 0.5) {
       race.jumpStart = true;
-      session.disqualified = true;
-      session.finished = true;
+      session.jumpStartDone = true;
       race.phase = 'green';
-      showLights(false);
       jumpStartChecked = true;
-      RACE_STATE.textContent = 'SALTO EN FALSO · DESCALIFICADO';
+      if (FAULTS) FAULTS.jumpStart();
+      RACE_STATE.textContent = 'SALIDA ANTICIPADA · +20 s';
       RACE_STATE.className = 'yellow';
-      return;
+      document.getElementById('lights-screen').classList.add('receding');
+      setTimeout(() => showLights(false), 900);
+      setTimeout(() => { if (RACE_STATE.textContent === 'SALIDA ANTICIPADA · +20 s') RACE_STATE.textContent = ''; }, 3000);
     }
     return;
   }
-  // Justo al apagarse (salida limpia)
+  // Justo al apagarse (salida limpia): el gantry queda 3 s y sale con animación
   if (!jumpStartChecked && race.phase === 'green') {
     jumpStartChecked = true;
-    showLights(false);
     AUDIO.lightsGo();
     document.body.classList.add('leaderboard');
-    gapDisplay = 'leader';
+    gapDisplay = 'ahead';
     RACE_STATE.textContent = '¡LUCES FUERA!';
     RACE_STATE.className = 'green';
     setTimeout(() => { if (RACE_STATE.textContent === '¡LUCES FUERA!') RACE_STATE.textContent = ''; }, 1500);
+    if (race._lightsGoneCb) race._lightsGoneCb();
     // AQUÍ arranca el reloj (el HUD muestra tiempo de vuelta; la vuelta 1 se
     // cierra al CRUZAR la meta por primera vez — nada de tiempos falsos).
     timer.t0 = performance.now();
@@ -1131,7 +1381,26 @@ function updateRaceFlow(dt) {
     sectorDone = {};
     currentSector = 1;
   }
+  // Faltas: plazos (atajos con devolución de posición)
+  if (FAULTS) FAULTS.tick(now());
+  // Banner de falta visible durante unos segundos
+  if (faultNoticeT > 0) {
+    faultNoticeT -= dt;
+    if (faultNoticeT <= 0 && FAULT_BANNER) FAULT_BANNER.classList.remove('on');
+  }
 }
+let faultNoticeT = 0;
+function now() { return performance.now(); }
+setFaultListener((type, data) => {
+  if (type === 'notice') {
+    if (FAULT_BANNER) {
+      FAULT_BANNER.textContent = data.text;
+      FAULT_BANNER.className = data.kind;
+      FAULT_BANNER.classList.add('on');
+    }
+    faultNoticeT = data.ms / 1000;
+  }
+});
 
 function endRace() {
   if (!session || !race || resultsShown) return;
@@ -1237,8 +1506,38 @@ function tick(now) {
   const dt = Math.min((now - last) / 1000, 1 / 30);
   last = now;
 
+  updateRecover(dt);
   if (playing && !paused && carReady) {
-    if (session && session.mode === 'race' && race) {
+    if (session && session.mode === 'mp') {
+      // ---- MULTIJUGADOR ----
+      updatePhysics(dt);
+      updateMpRemote(dt);
+      if (session.reconPhase === 'count') {
+        // Cuenta atrás 3-2-1 (bloquea el coche hasta la salida)
+        session.reconT -= dt;
+        const n = Math.ceil(session.reconT);
+        const txt = n > 0 ? String(n) : '¡SALIDA!';
+        if (RACE_STATE.textContent !== txt) {
+          RACE_STATE.textContent = txt;
+          AUDIO.countdown();
+        }
+        drive.vx = 0;
+        if (session.reconT <= 0) {
+          session.reconPhase = 'run';
+          session.clockOn = true;
+          timer.t0 = performance.now();
+        }
+      } else if (session.reconPhase === 'run') {
+        if (session.mpGridAssigned >= 0) {
+          updateMpLights(dt);
+        }
+      } else if (session.reconPhase === 'grid') {
+        // En parrilla: colisiones activas de nuevo + faltas activas
+        if (race) race.noCollisions = false;
+        if (FAULTS) FAULTS.enabled = true;
+        updateMpLights(dt);
+      }
+    } else if (session && session.mode === 'race' && race) {
       updateRaceFlow(dt);
       // La física sigue SIEMPRE activa (el flujo congela el coche en
       // countdown); los bots corren desde el apagado, incluso tras tu meta.
@@ -1255,11 +1554,11 @@ function tick(now) {
       updatePhysics(dt);
     }
     // Motor: revs = fracción dentro de la marcha actual, load = gas
-    const gi = Math.min(5, Math.max(0, gearOf(Math.abs(drive.vx)) - 1));
+    const gi = Math.min(6, Math.max(0, gearOf(Math.abs(drive.vx)) - 1));
     const lo = gi === 0 ? 0 : GEAR_TOPS[gi - 1];
     const hi = GEAR_TOPS[gi];
     lastFrac = hi > lo ? THREE.MathUtils.clamp((Math.abs(drive.vx) - lo) / (hi - lo), 0, 1) : 0;
-    AUDIO.updateEngine(lastFrac, throttleInput() ? 1 : 0, !session.disqualified);
+    AUDIO.updateEngine(lastFrac, throttleInput() ? 1 : 0, !(session && session.disqualified));
     // Sonido del cambio de marcha (solo subiendo de marcha)
     const gearNow = gearOf(Math.abs(drive.vx));
     if (gearNow !== _lastGearSnd && gearNow > _lastGearSnd && drive.vx > 2) AUDIO.shiftGear();
@@ -1268,11 +1567,10 @@ function tick(now) {
     AUDIO.updateEngine(0, 0, false);
   }
 
-  if (cameraMode === 'chase') updateChaseCamera();
-  else updateNoseCamera(now / 1000);
+  updateNoseCamera(now / 1000);
   updateHUD();
   renderer.render(scene, camera);
-  if (cameraMode === 'nose') updateRearView();
+  updateRearView();
   requestAnimationFrame(tick);
 }
 requestAnimationFrame(tick);

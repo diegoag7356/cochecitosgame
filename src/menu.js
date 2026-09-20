@@ -27,6 +27,10 @@ export function getCookie(name) {
 
 const $ = (id) => document.getElementById(id);
 const show = (id, on) => { $(id).classList.toggle('open', !!on); };
+
+// ---- Multijugador (Firebase Realtime Database) ----
+let MP = null;
+export function setMultiplayer(mp) { MP = mp; }
 function onlyScreen(id) {
   for (const s of document.querySelectorAll('.screen')) s.classList.remove('open');
   if (id) show(id, true);
@@ -69,6 +73,68 @@ export function initMenus(game) {
   $('btn-back-home').addEventListener('click', () => onlyScreen('screen-home'));
   $('btn-tt-back').addEventListener('click', () => onlyScreen('screen-modes'));
   $('btn-race-back').addEventListener('click', () => onlyScreen('screen-modes'));
+
+  // ---- Multijugador ----
+  const mp = { name: cookieName(), laps: 5, size: 8 };
+  $('btn-mp').addEventListener('click', () => {
+    $('mp-name').value = mp.name;
+    $('mp-join-name').value = mp.name;
+    onlyScreen('screen-mp');
+  });
+  $('btn-mp-back').addEventListener('click', () => onlyScreen('screen-modes'));
+  $('mp-minus').addEventListener('click', () => { mp.laps = Math.max(3, mp.laps - 1); $('mp-laps').textContent = mp.laps; });
+  $('mp-plus').addEventListener('click', () => { mp.laps = Math.min(20, mp.laps + 1); $('mp-laps').textContent = mp.laps; });
+  $('mp-size-minus').addEventListener('click', () => { mp.size = Math.max(2, mp.size - 1); $('mp-size').textContent = mp.size; });
+  $('mp-size-plus').addEventListener('click', () => { mp.size = Math.min(8, mp.size + 1); $('mp-size').textContent = mp.size; });
+  const mpName = (inputId) => {
+    const v = $(inputId).value.toUpperCase().replace(/[^A-Z0-9 _-]/g, '').slice(0, 12);
+    $(inputId).value = v;
+    return v;
+  };
+  $('mp-name').addEventListener('input', () => { mp.name = mpName('mp-name'); setCookie('f1_name', mp.name); });
+  $('mp-join-name').addEventListener('input', () => { mp.name = mpName('mp-join-name'); setCookie('f1_name', mp.name); });
+  $('mp-code').addEventListener('input', (e) => {
+    e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 5);
+  });
+  $('btn-mp-create').addEventListener('click', async () => {
+    const name = mpName('mp-name');
+    if (!name) { $('mp-name').focus(); return; }
+    $('btn-mp-create').textContent = 'CREANDO…';
+    try {
+      if (!MP) throw new Error('no-mp');
+      const code = await MP.createRoom({ name, laps: mp.laps, roomSize: mp.size });
+      $('mp-room-code').textContent = code;
+      onlyScreen('screen-mp-room');
+    } catch (err) {
+      alert('No se pudo crear la sala: ' + (err.message || err));
+    }
+    $('btn-mp-create').textContent = 'CREAR SALA';
+  });
+  $('btn-mp-join').addEventListener('click', async () => {
+    const name = mpName('mp-join-name');
+    const code = $('mp-code').value.trim();
+    if (!name) { $('mp-join-name').focus(); return; } // sin nombre NO puedes poner código
+    if (!code) { $('mp-code').focus(); return; }
+    $('btn-mp-join').textContent = 'UNIÉNDOTE…';
+    try {
+      if (!MP) throw new Error('no-mp');
+      await MP.join(code, name);
+      $('mp-room-code').textContent = code;
+      onlyScreen('screen-mp-room');
+    } catch (err) {
+      alert('No se pudo unir: ' + (err.message || err));
+    }
+    $('btn-mp-join').textContent = 'UNIRSE';
+  });
+  $('btn-mp-leave').addEventListener('click', async () => {
+    if (MP) await MP.leaveRoom();
+    onlyScreen('screen-mp');
+  });
+  $('btn-mp-begin').addEventListener('click', () => MP && MP.startPicking());
+  $('btn-mp-launch').addEventListener('click', () => MP && MP.startRecon());
+  $('btn-mp-ready').addEventListener('click', () => {
+    if (MP) MP.setReady(!MP.me()?.ready);
+  });
 
   // --- Free play: sin semáforo, sin cronometraje oficial ---
   $('btn-free').addEventListener('click', () => {
@@ -181,6 +247,50 @@ export function initMenus(game) {
   $('btn-again').addEventListener('click', () => game.restartSession());
   $('btn-res-menu').addEventListener('click', () => game.quitToMenu());
 }
+
+  // ---- Render de la sala en vivo (se llama desde el callback de mp.js) ----
+  let lastPlayersHTML = '';
+  window.__renderMpRoom = (room) => {
+    if (!room || !$('screen-mp-room').classList.contains('open')) return;
+    const ps = MP.playersSorted();
+    const meta = room.meta || {};
+    // Estado de la sala
+    const statusTxt = {
+      lobby: 'ESPERANDO JUGADORES (' + ps.length + '/' + (meta.roomSize || 8) + ')',
+      picking: 'ELIGIENDO COLORES POR ORDEN DE UNIÓN',
+      'picking-done': 'ESPERANDO A QUE TODOS ESTÉN LISTOS',
+      recon: 'VUELTA DE RECONOCIMIENTO',
+      grid: 'FORMANDO PARRILLA…',
+      racing: '¡CARRERA!',
+      finished: 'CARRERA TERMINADA',
+    }[meta.status] || meta.status;
+    $('mp-room-status').textContent = statusTxt;
+    // Jugadores
+    let html = '';
+    for (const p of ps) {
+      const isTurn = meta.status === 'picking' && meta.pickingTurn === ps.indexOf(p);
+      html += '<div class="b-row" style="font-size:14px; padding:6px 10px;">'
+        + '<span class="b-tape" style="background:' + p.color + '"></span>'
+        + '<span class="b-name">' + p.name + (p.id === 'p' ? '' : '') + (isTurn ? ' ← ELIGE' : '') + '</span>'
+        + '<span class="b-gap">' + (p.ready ? 'LISTO ✓' : '') + '</span></div>';
+    }
+    if (html !== lastPlayersHTML) { lastPlayersHTML = html; $('mp-players').innerHTML = html; }
+    // Turno de color
+    const me = MP.me();
+    const myTurn = MP.myTurn();
+    $('mp-turn-box').style.display = myTurn ? '' : 'none';
+    if (myTurn && !$('mp-colors').hasChildNodes()) {
+      buildSwatches($('mp-colors'), CAR_COLORS, me?.color, (hex) => MP.pickColor(hex));
+    }
+    // Host tools
+    $('mp-host-tools').style.display = MP.isHost && (meta.status === 'lobby') ? '' : 'none';
+    $('btn-mp-launch').style.display = MP.isHost && meta.status === 'picking-done' && MP.allReady() ? '' : 'none';
+    // Botón LISTO
+    $('btn-mp-ready').style.display = meta.status === 'picking-done' ? '' : 'none';
+    if (me) $('btn-mp-ready').textContent = me.ready ? 'LISTO ✓' : 'LISTO';
+    // Cuando el host lanza la vuelta de reconocimiento, main.js toma el control
+    if (meta.status === 'recon' && window.__mpStartRecon) window.__mpStartRecon(room);
+  };
 
 // Utilidades para que main.js gestione pantallas de estado
 export const screens = {

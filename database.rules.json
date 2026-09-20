@@ -1,0 +1,20 @@
+{
+  /* APEX GP · multijugador: salas públicas de juego. Sin datos personales:
+     solo nombres de jugador, colores y posiciones de coches. */
+  "rules": {
+    "rooms": {
+      "$roomId": {
+        ".read": true,
+        ".write": true,
+        "meta": {
+          ".write": "!data.exists() || (data.child('status').val() !== 'racing' && !newData.parent().child('players').hasChildren())"
+        },
+        "players": {
+          "$pid": {
+            ".validate": "newData.hasChildren(['name','color','ready']) && newData.child('name').val().length <= 12"
+          }
+        }
+      }
+    }
+  }
+}

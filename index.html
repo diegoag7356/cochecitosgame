@@ -91,7 +91,7 @@
 
     /* ================= SEMÁFORO ================= */
     #lights-screen {
-      position: fixed; top: 0; left: 0; right: 0; height: 220px; z-index: 34;
+      position: fixed; top: 0; left: 0; right: 0; height: 220px; z-index: 12; /* BAJO la T-cam (z 6/7 no: 12 > 6) */
       display: none; align-items: flex-start; justify-content: center;
       background: transparent; pointer-events: none;
     }
@@ -104,23 +104,35 @@
       transition: margin-top .8s cubic-bezier(.2,.8,.2,1);
     }
     #lights-screen.open .lights-gantry { margin-top: 0; }
+    /* Tras apagarse: pausa 3 s y salida con la misma animación (margin-top -> -160) */
+    #lights-screen.receding .lights-gantry { margin-top: -160px; transition: margin-top .8s cubic-bezier(.65,0,.35,1); }
     .light-col { display: flex; flex-direction: row; }
     .bulb { width: 40px; height: 40px; border-radius: 50%; background: #1b222b; box-shadow: inset 0 2px 6px rgba(0,0,0,.8); transition: background .1s, box-shadow .1s; }
     .bulb.on { background: var(--accent); box-shadow: 0 0 18px rgba(255,40,0,.9), inset 0 2px 6px rgba(0,0,0,.35); }
     #lights-msg { position: absolute; top: 150px; font-family: var(--mono); color: #cfe0ef; font-size: 12px; letter-spacing: 3px; text-shadow: 0 1px 4px rgba(0,0,0,.8); opacity: 0; transition: opacity .4s; }
     #lights-screen.open #lights-msg { opacity: .85; }
 
-    /* Bandera azul (doblado por el líder) */
-    #blue-flag {
-      position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 8; display: none;
-      font-family: var(--mono); font-size: 17px; font-weight: 800; letter-spacing: 3px;
-      color: #04182e; background: var(--cyan); padding: 7px 20px; border-radius: 8px;
-      box-shadow: 0 0 22px rgba(34,211,238,.65); user-select: none; pointer-events: none;
-      animation: bluePulse 1.1s ease-in-out infinite;
+    /* Banner de faltas/penalizaciones */
+    #fault-banner {
+      position: fixed; top: 200px; left: 50%; transform: translateX(-50%); z-index: 9; display: block;
+      font-family: var(--mono); font-size: 16px; font-weight: 800; letter-spacing: 2px;
+      padding: 8px 22px; border-radius: 9px; opacity: 0; transition: opacity .25s;
+      user-select: none; pointer-events: none; color: #1c1400; background: var(--gold);
+      box-shadow: 0 0 20px rgba(255,210,61,.45);
     }
-    #blue-flag.on { display: block; }
-    @keyframes bluePulse { 0%, 100% { opacity: .65; } 50% { opacity: 1; } }
-    body.nose-cam #blue-flag { top: 206px; }
+    #fault-banner.on { opacity: 1; }
+    #fault-banner.red { color: #fff; background: #d91f2c; box-shadow: 0 0 22px rgba(217,31,44,.6); }
+    #fault-banner.yellow { color: #1c1400; background: var(--gold); }
+
+    /* Viñeta de fantasma (recuperación con T) */
+    #ghost-vignette {
+      position: fixed; inset: 0; z-index: 10; pointer-events: none; opacity: 0;
+      transition: opacity .3s;
+      background: radial-gradient(ellipse at center, transparent 55%, rgba(120,220,255,.35) 100%);
+      animation: ghostBlink 0.4s linear infinite;
+    }
+    #ghost-vignette.on { opacity: 1; }
+    @keyframes ghostBlink { 0%, 100% { opacity: .45; } 50% { opacity: 1; } }
 
     /* Overlay del sector (S1/S2/S3) */
     #sector-flash {
@@ -268,6 +280,17 @@
     body.leaderboard #race-state { display: block; }
     body.nose-cam #race-state { top: 206px; }
 
+    /* Barra de progreso de recuperación (mantener T) */
+    #recover-bar {
+      position: fixed; bottom: 130px; left: 50%; transform: translateX(-50%); z-index: 9;
+      display: none; font-family: var(--mono); color: #cfe0ef; font-size: 11px;
+      letter-spacing: 2px; text-align: center; user-select: none; pointer-events: none;
+      text-shadow: 0 1px 4px rgba(0,0,0,.8);
+    }
+    #recover-bar.on { display: block; }
+    #recover-bar .rb-track { width: 160px; height: 5px; border-radius: 3px; background: rgba(255,255,255,.18); margin-top: 4px; overflow: hidden; }
+    #recover-bar .rb-fill { height: 100%; width: 0%; background: var(--cyan); border-radius: 3px; }
+
     /* Minimapa */
     #minimap {
       position: fixed; left: 16px; bottom: 44px; z-index: 5; user-select: none; pointer-events: none;
@@ -337,6 +360,7 @@
       <button class="btn" id="btn-timetrial">⏱ CRONOMETRAJE</button>
       <button class="btn" id="btn-race">🏁 CARRERA (IA)</button>
       <button class="btn" id="btn-free">🔥 JUEGO LIBRE</button>
+      <button class="btn" id="btn-mp">🌐 MULTIJUGADOR</button>
       <button class="btn sm ghost" id="btn-back-home">← VOLVER</button>
     </div>
   </div>
@@ -364,6 +388,62 @@
       </div>
       <button class="btn" id="btn-tt-start">COMENZAR SESIÓN</button>
       <button class="btn sm ghost" id="btn-tt-back">← VOLVER</button>
+    </div>
+  </div>
+
+  <!-- ============ MULTIJUGADOR ============ -->
+  <div id="screen-mp" class="screen">
+    <div class="menu-card config-panel">
+      <div class="crumb">MULTIJUGADOR</div>
+      <div class="menu-title">CREAR O UNIRTE A UNA SALA</div>
+      <div style="display:flex; gap:26px; align-items:flex-start;">
+        <div class="cfg-block">
+          <div class="cfg-label">CREAR SALA</div>
+          <div class="name-input" style="width:220px; font-size:14px;">VUELTAS</div>
+          <div class="laps-controls">
+            <button class="laps-btn" id="mp-minus">−</button>
+            <div class="laps-val" id="mp-laps" style="font-size:28px;">5</div>
+            <button class="laps-btn" id="mp-plus">+</button>
+          </div>
+          <div class="laps-hint">TAMAÑO SALA</div>
+          <div class="laps-controls">
+            <button class="laps-btn" id="mp-size-minus">−</button>
+            <div class="laps-val" id="mp-size" style="font-size:28px;">8</div>
+            <button class="laps-btn" id="mp-size-plus">+</button>
+          </div>
+          <div class="cfg-label">TU NOMBRE</div>
+          <input class="name-input" id="mp-name" maxlength="12" placeholder="PILOTO" />
+          <button class="btn sm" id="btn-mp-create">CREAR SALA</button>
+        </div>
+        <div class="cfg-block">
+          <div class="cfg-label">UNIRSE A SALA</div>
+          <div class="cfg-label">TU NOMBRE (OBLIGATORIO)</div>
+          <input class="name-input" id="mp-join-name" maxlength="12" placeholder="PILOTO" />
+          <div class="cfg-label">CÓDIGO DE SALA</div>
+          <input class="name-input" id="mp-code" maxlength="5" placeholder="A1B2C" style="text-transform:uppercase; letter-spacing:8px; font-size:24px;" />
+          <button class="btn sm" id="btn-mp-join">UNIRSE</button>
+        </div>
+      </div>
+      <button class="btn sm ghost" id="btn-mp-back">← VOLVER</button>
+    </div>
+  </div>
+
+  <!-- ============ SALA MULTIJUGADOR ============ -->
+  <div id="screen-mp-room" class="screen">
+    <div class="menu-card config-panel">
+      <div class="crumb">SALA · <span id="mp-room-code">—</span></div>
+      <div class="menu-title" id="mp-room-status">ESPERANDO JUGADORES</div>
+      <div id="mp-players" style="display:flex; flex-direction:column; gap:6px; min-width:380px;"></div>
+      <div id="mp-turn-box" style="display:none;">
+        <div class="cfg-label">TU TURNO: ELIGE COLOR</div>
+        <div class="swatches" id="mp-colors"></div>
+      </div>
+      <div id="mp-host-tools" style="display:none;">
+        <button class="btn sm" id="btn-mp-begin">COMENZAR (ELEGIR COLORES)</button>
+        <button class="btn sm" id="btn-mp-launch" style="display:none;">LANZAR VUELTA DE RECONOCIMIENTO</button>
+      </div>
+      <button class="btn" id="btn-mp-ready" style="display:none;">LISTO</button>
+      <button class="btn sm ghost" id="btn-mp-leave">SALIR DE LA SALA</button>
     </div>
   </div>
 
@@ -480,7 +560,8 @@
     </div>
   </div>
   <div id="drs-big"><span>DRS</span><span class="sub">ESPACIO</span></div>
-  <div id="blue-flag">BANDERA AZUL · DEJA PASAR</div>
+  <div id="fault-banner"></div>
+  <div id="ghost-vignette"></div>
   <div id="sector-flash"><span id="sector-name">SECTOR 2</span><span class="sf-sub" id="sector-time"></span></div>
   <div id="race-state"></div>
   <div id="board">
@@ -488,7 +569,8 @@
     <div id="board-rows"></div>
   </div>
   <canvas id="minimap" width="240" height="240"></canvas>
-  <div id="hud-hint">←/→ girar · W acelerar · S frenar/atrás · ESPACIO DRS · C cámara · ENTER intervalos · ESC pausa</div>
+  <div id="recover-bar">MANTÉN T PARA VOLVER A LA PISTA<div class="rb-track"><div class="rb-fill" id="rb-fill"></div></div></div>
+  <div id="hud-hint">←/→ girar · W acelerar · S frenar/atrás · ESPACIO DRS · T volver a pista · ENTER intervalos · ESC pausa</div>
   <div id="hud-mode">cámara: persecución</div>
   <script type="module" src="/src/main.js"></script>
 </body>

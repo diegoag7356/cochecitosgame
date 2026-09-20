@@ -47,6 +47,15 @@ function mulberry32(seed) {
   };
 }
 
+// Fantasma del jugador (tras recuperación con T): invulnerable y sin colisión
+let playerGhostUntil = 0;
+export function setPlayerGhost(seconds) {
+  playerGhostUntil = performance.now() + seconds * 1000;
+}
+export function isPlayerGhost() {
+  return playerGhostUntil > performance.now();
+}
+
 // ---- OBB del coche (~4.6 x 1.9 m con alerones) + respuesta con impulso ----
 const CAR_HX = 0.95;
 const CAR_HZ = 2.3;
@@ -61,17 +70,15 @@ function obbAxes(h) {
 function obbOverlap(ax, az, aH, bx, bz, bH) {
   const A = obbAxes(aH), B = obbAxes(bH);
   const dx = bx - ax, dz = bz - az;
-  let bestDepth = Infinity, bestAxis = null;
+  const candidates = [];
   for (const axis of [A[0], A[1], B[0], B[1]]) {
     const proj = Math.abs(dx * axis[0] + dz * axis[1]);
     const ra = CAR_HZ * Math.abs(A[0][0] * axis[0] + A[0][1] * axis[1]) + CAR_HX * Math.abs(A[1][0] * axis[0] + A[1][1] * axis[1]);
     const rb = CAR_HZ * Math.abs(B[0][0] * axis[0] + B[0][1] * axis[1]) + CAR_HX * Math.abs(B[1][0] * axis[0] + B[1][1] * axis[1]);
-    if (proj > ra + rb) return null;
-    const depth = ra + rb - proj;
-    if (depth < bestDepth) { bestDepth = depth; bestAxis = axis; }
+    if (proj > ra + rb) return null; // separados en algún eje
+    candidates.push({ axis, depth: ra + rb - proj });
   }
-  const sgn = Math.sign(dx * bestAxis[0] + dz * bestAxis[1]) || 1;
-  return { nx: bestAxis[0] * sgn, nz: bestAxis[1] * sgn, depth: bestDepth };
+  return candidates;
 }
 
 export class Race {
@@ -133,6 +140,9 @@ export class Race {
         wobF: 0.6 + r() * 0.7,
         // Ligeras diferencias de ritmo en recta (simula slipstream/fiat)
         vBias: 0.985 + r() * 0.025,
+        // SALIDA REALISTA: reacción humana (0.25-0.7 s) + rampa de lanzamiento
+        reaction: 0.25 + r() * 0.45,
+        launch: 0.9 + r() * 0.5, // duración del control de lanzamiento
       };
       const nm = names.splice(Math.floor(r() * names.length), 1)[0] || 'BOT';
       this.bots.push({
@@ -241,11 +251,15 @@ export class Race {
       }
     } else {
       this.lightsHold -= dt;
-      if (this.lightsHold <= 0) this.phase = 'green';
+      if (this.lightsHold <= 0) {
+        this.phase = 'green';
+        this.greenAt = performance.now();
+      }
     }
   }
 
   stepBots(dt, player, P, audio) {
+    const now = performance.now();
     if (this.phase === 'countdown') { for (const b of this.bots) b.v = 0; return; }
     const trk = this.track;
     const L = trk.trackLen();
@@ -253,6 +267,16 @@ export class Race {
 
     for (const b of this.bots) {
       const br = b.brain;
+      // ---- SALIDA REALISTA: reacción humana + control de lanzamiento ----
+      let launchFactor = 1;
+      if (this.greenAt != null) {
+        const tGreen = (now - this.greenAt) / 1000;
+        if (tGreen < br.reaction) launchFactor = 0;       // todavía reaccionando
+        else if (tGreen < br.reaction + br.launch) {
+          launchFactor = 0.32 + 0.68 * ((tGreen - br.reaction) / br.launch);
+        }
+      }
+
       // Superficie
       const inf = trk.info(b.pos.x, b.pos.z);
       const offTrack = Math.abs(inf.lat) > trk.roadHalf + trk.kerbW * 0.6;
@@ -286,6 +310,9 @@ export class Race {
       const R = Math.max(trk._radii[idx], 12);
       const latMax = (P.latBase + P.latQ * vAbs * vAbs) * grip;
       let vTarget = Math.min(95 * br.vBias - b.vLossPerm, Math.sqrt(latMax * br.corner * R));
+      // Control de lanzamiento: velocidad objetivo limitada durante los
+      // primeros metros (arranque progresivo, como un humano)
+      vTarget = Math.min(vTarget, 30 + 70 * launchFactor);
       // Error HUMANO propio (no sincronizado): llega pasado y frena más
       b.brain.errPhase += dt * br.errRate;
       if (Math.sin(br.errPhase * 2.3) > 0.992 - this.profile.errP) vTarget *= 0.88;
@@ -346,8 +373,9 @@ export class Race {
       const u = trk.arcOf(b.pos.x, b.pos.z);
       const side = Math.sign(((b.pos.x - trk.startPos.x) * trk.startTangent.x + (b.pos.z - trk.startPos.z) * trk.startTangent.z)) || 0;
       if (b.prevSide < 0 && side >= 0) {
-        if (b.lapStart == null) b.lapStart = performance.now(); // salida
-        else {
+        if (b.lapStart == null) {
+          b.lapStart = performance.now(); // cruce de salida: NO cuenta como vuelta
+        } else {
           const t = performance.now() - b.lapStart;
           if (!b.lapInvalid) {
             b.lastLap = t;
@@ -355,8 +383,8 @@ export class Race {
           }
           b.lapInvalid = false;
           b.lapStart = performance.now();
+          b.lap++;
         }
-        b.lap++;
       } else if (b.prevSide > 0 && side <= 0) {
         b.lapInvalid = true;
       }
@@ -377,56 +405,109 @@ export class Race {
     this._collisions(player, audio);
   }
 
+  // Sanciona una colisión del jugador según velocidad de aproximación y
+  // ángulo de impacto (roce = amonestación, embestida frontal = penalización).
+  _faultForPlayer(impact, frontality, rel) {
+    if (!this.faults) return;
+    const ghost = playerGhostUntil > performance.now();
+    if (ghost) return; // en modo fantasma no hay faltas
+    const frontal = frontality > 0.55 && rel > 6;   // embestida clara
+    const touch = rel > 0.8;                        // roce/touch con velocidad
+    if (frontal) this.faults.penalty('ram', impact, rel);
+    else if (touch) this.faults.penalty('touch', impact, rel);
+  }
+
   _collisions(player, audio) {
+    const now = performance.now();
+    const ghost = playerGhostUntil > now;
+    if (this.noCollisions) return; // vuelta de reconocimiento MP: sin toques
     const all = [
-      { isPlayer: true, pos: player.pos, heading: player.heading, vx: player.vx, mesh: null },
+      { isPlayer: true, pos: player.pos, heading: player.heading, vx: player.vx, mesh: null, ghost },
       ...this.bots,
     ];
+    for (const b of this.bots) { b.isPlayer = false; b.ghost = false; }
     for (let i = 0; i < all.length; i++) {
       for (let j = i + 1; j < all.length; j++) {
         const A = all[i], B = all[j];
+        if (A.ghost || B.ghost) continue; // el fantasma no colisiona
         const dx0 = B.pos.x - A.pos.x, dz0 = B.pos.z - A.pos.z;
         if (dx0 * dx0 + dz0 * dz0 > 42) continue;
-        const hit = obbOverlap(A.pos.x, A.pos.z, A.heading, B.pos.x, B.pos.z, B.heading);
-        if (!hit) continue;
-        const depth = hit.depth;
-        // Separación 50/50
-        const push = depth / 2 + 0.005;
-        A.pos.x -= hit.nx * push; A.pos.z -= hit.nz * push;
-        B.pos.x += hit.nx * push; B.pos.z += hit.nz * push;
+        const candidates = obbOverlap(A.pos.x, A.pos.z, A.heading, B.pos.x, B.pos.z, B.heading);
+        if (!candidates) continue;
+        // SEPARACIÓN: por el eje de menor penetración (el más estable)
+        let minAx = candidates[0];
+        for (const c of candidates) if (c.depth < minAx.depth) minAx = c;
+        const sgn0 = Math.sign(dx0 * minAx.axis[0] + dz0 * minAx.axis[1]) || 1;
+        const sepX = minAx.axis[0] * sgn0, sepZ = minAx.axis[1] * sgn0;
+        const push = minAx.depth / 2 + 0.005;
+        A.pos.x -= sepX * push; A.pos.z -= sepZ * push;
+        B.pos.x += sepX * push; B.pos.z += sepZ * push;
 
-        // Velocidades de aproximación a lo largo de la normal
-        const fA = { x: -Math.sin(A.heading), z: -Math.cos(A.heading) };
-        const fB = { x: -Math.sin(B.heading), z: -Math.cos(B.heading) };
+        // IMPULSO: sobre el eje de aproximación REAL (el de mayor penetración
+        // entre los que tienen velocidad de cierre) — así un morro-cola
+        // empuja de verdad aunque el eje lateral tenga más solape.
+        // FORWARD COMO ARRAY [x, z] (se indexa con [0]/[1] abajo)
+        const fA = [-Math.sin(A.heading), -Math.cos(A.heading)];
+        const fB = [-Math.sin(B.heading), -Math.cos(B.heading)];
         const vA = A.isPlayer ? (player.vx || 0) : A.v;
         const vB = B.isPlayer ? (player.vx || 0) : B.v;
-        const sA = vA * (fA[0] * hit.nx + fA[1] * hit.nz);   // velocidad de A hacia la normal
-        const sB = vB * (fB[0] * hit.nx + fB[1] * hit.nz);
-        // Impulso 1D: intercambio con restitución 0.25 (choque semi-inelástico)
-        const rel = sA - sB;
-        if (rel > 0.5) {
+        let best = null;
+        const seenDirs = new Set();
+        for (const c of candidates) {
+          const key = Math.abs(c.axis[0]).toFixed(2) + '|' + Math.abs(c.axis[1]).toFixed(2);
+          if (seenDirs.has(key)) continue;
+          seenDirs.add(key);
+          const s = Math.sign(dx0 * c.axis[0] + dz0 * c.axis[1]) || 1;
+          const nx = c.axis[0] * s, nz = c.axis[1] * s;
+          const relAx = vA * (fA[0] * nx + fA[1] * nz) - vB * (fB[0] * nx + fB[1] * nz);
+          if (relAx > 0.5 && (!best || c.depth > best.depth)) best = { nx, nz, depth: c.depth, rel: relAx };
+        }
+        if (!best) continue; // solo se rozan sin acercarse: nada de impulso
+        const hit = best;
+        const depth = hit.depth;
+        const rel = hit.rel;
+        {
           const rest = 0.25;
           const jImp = (1 + rest) * rel / 2;
           const impact = Math.min(1, rel / 30);
+          // Frontalidad de A respecto a B: 1 = A va de morro contra B
+          const frontality = Math.abs(fA[0] * hit.nx + fA[1] * hit.nz);
+          const G = THREE.MathUtils.clamp(impact * 2.2, 0.15, 1);
+
           if (!A.isPlayer) {
             A.v = Math.max(0, A.v - jImp * Math.abs(fA[0] * hit.nx + fA[1] * hit.nz));
-            // Rotación por toque: el golpe lateral desvía la trazada
-            const lateral = 1 - Math.abs(fA[0] * hit.nx + fA[1] * hit.nz);
-            A.heading += (hit.nz * fA[0] - hit.nx * fA[1]) * lateral * impact * 0.12;
+            // TROMPO REAL: el golpe añade velocidad angular que el bot recupera
+            const spinSign = (hit.nz * fA[0] - hit.nx * fA[1]) > 0 ? 1 : -1;
+            A.spinOmega = (A.spinOmega || 0) + spinSign * G * 4.5 * (0.3 + 0.7 * (1 - frontality));
             A.dmgFront = Math.min(1, A.dmgFront + impact * 0.5);
             A.vLossPerm = Math.min(6, A.vLossPerm + impact * 0.8);
           }
           if (!B.isPlayer) {
             B.v = Math.max(0, B.v - jImp * Math.abs(fB[0] * hit.nx + fB[1] * hit.nz));
-            const lateral = 1 - Math.abs(fB[0] * hit.nx + fB[1] * hit.nz);
-            B.heading += -(hit.nz * fB[0] - hit.nx * fB[1]) * lateral * impact * 0.12;
+            const spinSign = (hit.nz * fB[0] - hit.nx * fB[1]) > 0 ? 1 : -1;
+            B.spinOmega = (B.spinOmega || 0) + spinSign * G * 4.5 * (0.3 + 0.7 * (1 - frontality));
             B.dmgFront = Math.min(1, B.dmgFront + impact * 0.5);
             B.vLossPerm = Math.min(6, B.vLossPerm + impact * 0.8);
           }
-          // El jugador: pierde velocidad según el ángulo del impacto
-          const latP = 1 - Math.abs(fA[0] * hit.nx + fA[1] * hit.nz);
+          // El jugador: pierde velocidad + TROMPO (velocidad angular que
+          // integra la física: el coche gira de verdad y se recupera)
+          const latP = 1 - frontality;
           player.vx = Math.max(0, (player.vx || 0) - jImp * (0.6 + latP * 0.6));
+          const fP = { x: -Math.sin(player.heading), z: -Math.cos(player.heading) };
+          const pSpinSign = (hit.nz * fP.x - hit.nx * fP.z) > 0 ? 1 : -1;
+          player.spinOmega = (player.spinOmega || 0) - pSpinSign * G * 5.0 * (0.35 + 0.65 * latP);
           if (typeof this.onPlayerHit === 'function') this.onPlayerHit(impact, hit);
+          // La falta es SOLO de quien embiste (cierra más rápido hacia el otro)
+          if (A.isPlayer || B.isPlayer) {
+            // Velocidad de cierre de cada uno sobre la normal (n va de A a B):
+            // quien más cierra es quien embiste.
+            const closeA = vA * (fA[0] * hit.nx + fA[1] * hit.nz);
+            const closeB = -vB * (fB[0] * hit.nx + fB[1] * hit.nz);
+            const aRams = closeA >= closeB;
+            const playerRams = (A.isPlayer && aRams) || (B.isPlayer && !aRams);
+            const ramFrontality = aRams ? frontality : Math.abs(fB[0] * hit.nx + fB[1] * hit.nz);
+            if (playerRams) this._faultForPlayer(impact, ramFrontality, rel);
+          }
           if (audio && impact > 0.06) audio.crash(0.3 + impact);
         }
       }
@@ -441,19 +522,21 @@ export class Race {
     p.u = u;
   }
 
+  // Clasificación UNIFICADA: mismo progreso total para todos
+  // (vueltas + fracción de vuelta). Así el orden es idéntico en HUD,
+  // minimapa y resultados.
   liveStandings(playerName, playerColor, playerFinished, playerLaps) {
     const rows = [
-      { name: playerName, tag: this._tagOf(playerName), color: playerColor, prog: this.playerProgress.u, laps: playerLaps, isPlayer: true, finishTime: playerFinished ? (this.playerFinishTime || 0) : null, bestLap: this.playerBestLap || null },
+      { name: playerName, tag: this._tagOf(playerName), color: playerColor, prog: this.playerProgress.u, laps: playerLaps, total: playerLaps + this.playerProgress.u, isPlayer: true, finishTime: playerFinished ? (this.playerFinishTime || 0) : null, bestLap: this.playerBestLap || null },
     ];
     for (const b of this.bots) {
-      rows.push({ name: b.tag, tag: b.tag, color: b.color, prog: b.u, laps: b.lap, isPlayer: false, finishTime: b.finishTime, bestLap: b.bestLap });
+      rows.push({ name: b.tag, tag: b.tag, color: b.color, prog: b.u, laps: b.lap, total: b.lap + b.u, isPlayer: false, finishTime: b.finishTime, bestLap: b.bestLap });
     }
     rows.sort((a, b) => {
       if (a.finishTime != null && b.finishTime != null) return a.finishTime - b.finishTime;
       if (a.finishTime != null) return -1;
       if (b.finishTime != null) return 1;
-      if (b.laps !== a.laps) return b.laps - a.laps;
-      return b.prog - a.prog;
+      return b.total - a.total;
     });
     return rows;
   }
