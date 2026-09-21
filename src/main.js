@@ -8,7 +8,7 @@ import { Race } from './race.js';
 import { initMenus, screens } from './menu.js';
 import { GameAudio } from './audio.js';
 import { Faults, setFaultListener } from './faults.js';
-import { setPlayerGhost, isPlayerGhost } from './race.js';
+import { setPlayerGhost, isPlayerGhost, collidePlayerWithRemote } from './race.js';
 import { Multiplayer, MP_PID } from './mp.js';
 import { setMultiplayer } from './menu.js';
 
@@ -570,6 +570,7 @@ function beginSession() {
       session.reconDone = false;
       session.lapInvalid = false;
       session.mpGridAssigned = -1;
+      noMpCollisions = true;           // reconocimiento sin choques entre jugadores
       RACE_STATE.className = 'blue';
       RACE_STATE.textContent = '3';
       AUDIO.countdown();
@@ -701,8 +702,13 @@ function updateLapTimer() {
   // meta) se cierra la vuelta clasificatoria y te asignan hueco de parrilla
   // por orden de llegada. La posición de la línea la fija la propia pista.
   const MP_YELLOW_U = track.yellowU != null ? track.yellowU : 0.985;
-  if (session.mode === 'mp' && session.reconPhase === 'run' && prog >= MP_YELLOW_U) {
-    session.mpGridAssigned = session.mpGridAssigned < 0 ? mpGridCounter++ : session.mpGridAssigned;
+  // CRUCE hacia delante de la línea amarilla (no basta con prog >= u:
+  // si no, al estar detrás de la línea ya se cumpliría y te llevaría a
+  // parrilla sin dar la vuelta).
+  if (session.mode === 'mp' && session.reconPhase === 'run'
+      && session.mpGridAssigned < 0
+      && prev < MP_YELLOW_U && prog >= MP_YELLOW_U && fwd < 0.5) {
+    session.mpGridAssigned = mpGridCounter++;
     RACE_STATE.textContent = 'Sales en la Posición ' + (session.mpGridAssigned + 1);
     RACE_STATE.className = 'yellow';
     setStatusGrid(session.mpGridAssigned);
@@ -860,8 +866,9 @@ function updateMpLights(dt) {
       if (mpLights.holdT === 0) mpLights.holdT = 3 + Math.random() * 2;
       mpLights.holdT -= dt;
       if (mpLights.holdT <= 0) {
-        // ¡LUCES FUERA!
+        // ¡LUCES FUERA! — las bombillas SE APAGAN de verdad
         mpLights.out = true;
+        cols.forEach((col) => { const b = col.querySelector('.bulb'); if (b) b.classList.remove('on'); });
         AUDIO.lightsGo();
         RACE_STATE.textContent = '¡LUCES FUERA!';
         RACE_STATE.className = 'green';
@@ -891,6 +898,7 @@ function updateMpLights(dt) {
 // Publica mi posición (10 Hz) y dibuja los coches de los otros jugadores
 let mpPubT = 0;
 const mpMeshes = new Map(); // pid -> THREE.Group
+const mpHitCd = {};        // pid -> timestamp de cooldown de colisión
 function updateMpRemote(dt) {
   if (!session || session.mode !== 'mp' || !MP.room) return;
   mpPubT -= dt;
@@ -899,9 +907,11 @@ function updateMpRemote(dt) {
     MP.publishState(drive.pos.x, drive.pos.z, drive.heading, drive.vx);
   }
   const seen = new Set();
+  const remotes = [];
   for (const p of MP.playersSorted()) {
     if (p.id === MP_PID || p.x == null) continue;
     seen.add(p.id);
+    remotes.push({ pid: p.id, x: p.x, z: p.z, heading: p.heading || 0, vx: p.vx || 0 });
     let g = mpMeshes.get(p.id);
     if (!g) {
       g = new THREE.Group();
@@ -920,7 +930,21 @@ function updateMpRemote(dt) {
   for (const [idg, g] of mpMeshes) {
     if (!seen.has(idg)) { scene.remove(g); mpMeshes.delete(idg); }
   }
+  // COLISIONES con coches remotos (misma física que con bots)
+  if (!noMpCollisions && remotes.length) {
+    const hits = collidePlayerWithRemote(drive, remotes, mpHitCd);
+    for (const h of hits) {
+      playerDmg = Math.min(1, playerDmg + h.impact * 0.4);
+      camShake = Math.min(0.9, camShake + h.impact * 0.8);
+      AUDIO.crash(0.3 + h.impact);
+      if (FAULTS && h.rel > 0.8) {
+        if (h.frontality > 0.55 && h.rel > 6) FAULTS.penalty('ram', h.impact, h.rel);
+        else FAULTS.penalty('touch', h.impact, h.rel);
+      }
+    }
+  }
 }
+let noMpCollisions = false; // true solo durante la vuelta de reconocimiento
 // Línea amarilla de clasificación MP: la construye track.buildYellowLine()
 // (quad sobre el asfalto que sigue la curva de la pista, no se corta).
 let sectorStart = 0, currentSector = 1, sectorFlashTO = null;
@@ -934,17 +958,20 @@ function placeAtStart() {
   if (session && session.mode === 'race' && race) {
     pos = race.playerStart.pos; heading = race.playerStart.heading;
   }
-  // MP: salida en la LÍNEA DE META (no parrilla) escalonados por orden de unión
+  // MP: salida escalonada por orden de unión, colocada POR ARCO EXACTO
+  // (posAtArc) unos 22-42 m detrás de la línea amarilla — así la vuelta
+  // de posiciones es siempre completa y el cruce de la línea se detecta.
   if (session && session.mode === 'mp') {
-    const tg = track.startTangent;
-    const nlx = -tg.z, nlz = tg.x;
     const k = (session.mpSlot || 0);
-    pos = new THREE.Vector3(
-      track.startPos.x - tg.x * 10 - nlx * (k % 2 === 0 ? 3.4 : -3.4) * Math.floor(k / 2),
-      0,
-      track.startPos.z - tg.z * 10 - nlz * (k % 2 === 0 ? 3.4 : -3.4) * Math.floor(k / 2)
-    );
-    heading = track.startHeading;
+    const L = track.trackLen();
+    const yU = track.yellowU != null ? track.yellowU : 0.98;
+    const row = Math.floor(k / 2);
+    const startU = ((yU - (22 + 10 * row) / L) % 1 + 1) % 1;
+    const lat = (k % 2 === 0 ? 3.4 : -3.4);
+    const p = track.posAtArc(startU, lat);
+    const pa = track.posAtArc((startU + 6 / L) % 1, lat);
+    pos = new THREE.Vector3(p.x, 0, p.z);
+    heading = Math.atan2(-(pa.x - p.x), -(pa.z - p.z));
   }
   drive.pos.copy(pos);
   drive.heading = heading;
@@ -1523,8 +1550,9 @@ function tick(now) {
       updatePhysics(dt);
       updateMpRemote(dt);
       if (session.reconPhase === 'count') {
-        // Cuenta atrás 3-2-1 (bloquea el coche hasta la salida)
-        session.reconT -= dt;
+        // Cuenta atrás 3-2-1 en PANTALLA GRANDE (no depende del leaderboard)
+        RACE_STATE.className = 'yellow countdown';
+        document.body.classList.add('race-countdown');
         const n = Math.ceil(session.reconT);
         const txt = n > 0 ? String(n) : '¡SALIDA!';
         if (RACE_STATE.textContent !== txt) {
@@ -1536,8 +1564,14 @@ function tick(now) {
           session.reconPhase = 'run';
           session.clockOn = true;
           timer.t0 = performance.now();
+          setTimeout(() => {
+            document.body.classList.remove('race-countdown');
+            if (RACE_STATE.className.includes('countdown')) RACE_STATE.textContent = '';
+          }, 1200);
         }
       } else if (session.reconPhase === 'run') {
+        // Vuelta de posiciones: SIN colisiones entre jugadores (como pediste)
+        noMpCollisions = true;
         if (session.mpGridAssigned >= 0) {
           updateMpLights(dt);
         }
@@ -1548,6 +1582,7 @@ function tick(now) {
           session._gridPlaced = true;
           placeMpAtGrid(session.mpGridAssigned);
         }
+        noMpCollisions = false;
         updateMpLights(dt);
       }
     } else if (session && session.mode === 'race' && race) {

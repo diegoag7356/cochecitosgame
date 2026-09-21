@@ -127,7 +127,7 @@ export class Multiplayer {
   }
   async pickColor(hex) {
     if (!this.myTurn() || !this.room) return false;
-    const taken = this.playersSorted().some((p) => p.color === hex);
+    const taken = this.playersSorted().some((p) => p.id !== pid && p.color === hex);
     if (taken) return false;
     await update(ref(db, `rooms/${this.roomId}/players/${pid}`), { color: hex });
     // Pasa el turno (o termina la fase)
@@ -164,13 +164,13 @@ export class Multiplayer {
     await update(ref(db, `rooms/${this.roomId}/meta`), { status });
   }
   // ---- Estado en pista (10 Hz) ----
-  async publishState(x, z, heading, v) {
+  async publishState(x, z, heading, vx) {
     if (!this.roomId) return;
     await update(ref(db, `rooms/${this.roomId}/players/${pid}`), {
       x: Math.round(x * 100) / 100,
       z: Math.round(z * 100) / 100,
       heading: Math.round((heading || 0) * 1000) / 1000,
-      v: Math.round((v || 0) * 10) / 10,
+      vx: Math.round((vx || 0) * 10) / 10,
     });
   }
   async leaveRoom() {

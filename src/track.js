@@ -812,9 +812,9 @@ export class Track {
   // los bordes y devuelve su posición de arco (u) para la lógica.
   buildYellowLine() {
     const C = this.centers, n = C.length;
-    // Punto central a ~80 m DETRÁS de la meta (ANTES de la parrilla: el
-    // último hueco está a −64 m), anclado al ÍNDICE DE META (no al índice 0).
-    const backIdx = Math.round((80 / this.trackLen()) * n);
+    // Punto central a ~95 m DETRÁS de la meta: detrás de la parrilla local
+    // (último hueco a −64 m) y antes de la salida MP (−115 m).
+    const backIdx = Math.round((95 / this.trackLen()) * n);
     const iStart = Math.round(this.startFrac * n) % n;
     const iC = (iStart - backIdx + n) % n;
     // LÍNEA TRANSVERSAL: como la de meta, cruza el asfalto de borde a borde.

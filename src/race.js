@@ -82,6 +82,55 @@ function obbOverlap(ax, az, aH, bx, bz, bH) {
   return candidates;
 }
 
+// Colisión del JUGADOR con coches REMOTOS (multijugador): misma OBB y
+// física de impulso que entre bots. Devuelve los impactos del frame.
+export function collidePlayerWithRemote(player, remotes, cdMap) {
+  const now = performance.now();
+  const hits = [];
+  for (const rm of remotes) {
+    const dx0 = rm.x - player.pos.x, dz0 = rm.z - player.pos.z;
+    if (dx0 * dx0 + dz0 * dz0 > 42) continue;
+    if (cdMap[rm.pid] > now) continue;
+    const cands = obbOverlap(player.pos.x, player.pos.z, player.heading, rm.x, rm.z, rm.heading);
+    if (!cands) continue;
+    // SEPARACIÓN por el eje de menor penetración
+    let minAx = cands[0];
+    for (const c of cands) if (c.depth < minAx.depth) minAx = c;
+    const sgn0 = Math.sign(dx0 * minAx.axis[0] + dz0 * minAx.axis[1]) || 1;
+    const sepX = minAx.axis[0] * sgn0, sepZ = minAx.axis[1] * sgn0;
+    const push = minAx.depth / 2 + 0.005;
+    player.pos.x -= sepX * push; player.pos.z -= sepZ * push;
+    rm.x += sepX * push; rm.z += sepZ * push; // empuje visual del remoto
+    // IMPULSO sobre el eje de aproximación real
+    const fA = [-Math.sin(player.heading), -Math.cos(player.heading)];
+    const fB = [-Math.sin(rm.heading), -Math.cos(rm.heading)];
+    const vA = Math.max(player.vx || 0, 0);
+    const vB = Math.max(rm.vx || 0, 0);
+    let best = null;
+    const seen = new Set();
+    for (const c of cands) {
+      const key = Math.abs(c.axis[0]).toFixed(2) + '|' + Math.abs(c.axis[1]).toFixed(2);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const s = Math.sign(dx0 * c.axis[0] + dz0 * c.axis[1]) || 1;
+      const nx = c.axis[0] * s, nz = c.axis[1] * s;
+      const relAx = vA * (fA[0] * nx + fA[1] * nz) - vB * (fB[0] * nx + fB[1] * nz);
+      if (relAx > 0.5 && (!best || c.depth > best.depth)) best = { nx, nz, rel: relAx };
+    }
+    if (!best) continue;
+    cdMap[rm.pid] = now + 450;
+    const jImp = (1 + 0.25) * best.rel / 2;
+    const impact = Math.min(1, best.rel / 30);
+    const dvP = -jImp * (fA[0] * best.nx + fA[1] * best.nz);
+    player.vx = Math.max(-12, player.vx + dvP);
+    const pSpinSign = (best.nz * fA[0] - best.nx * fA[1]) > 0 ? 1 : -1;
+    const G = THREE.MathUtils.clamp(impact * 2.2, 0.15, 1);
+    player.spinOmega = THREE.MathUtils.clamp((player.spinOmega || 0) - pSpinSign * G * 4.0 * 0.7, -2.2, 2.2);
+    hits.push({ impact, rel: best.rel, frontality: Math.abs(fA[0] * best.nx + fA[1] * best.nz) });
+  }
+  return hits;
+}
+
 export class Race {
   constructor(scene, track, opts) {
     this.scene = scene;
