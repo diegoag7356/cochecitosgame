@@ -56,6 +56,9 @@ function buildSwatches(container, colors, initial, onPick) {
   return () => sel;
 }
 
+// Estado del lobby MP: color elegido pendiente de confirmar
+let mpColorSel = null;
+
 // ============================================================
 export function initMenus(game) {
   const cookieName = () => getCookie('f1_name') || 'PILOTO';
@@ -134,6 +137,14 @@ export function initMenus(game) {
   $('btn-mp-launch').addEventListener('click', () => MP && MP.startRecon());
   $('btn-mp-ready').addEventListener('click', () => {
     if (MP) MP.setReady(!MP.me()?.ready);
+  });
+  // CONFIRMAR COLOR: solo pasa el turno cuando el jugador lo decide
+  $('btn-mp-confirm').addEventListener('click', async () => {
+    if (!MP || !MP.myTurn() || !mpColorSel) return;
+    $('btn-mp-confirm').textContent = 'CONFIRMANDO…';
+    const ok = await MP.pickColor(mpColorSel);
+    if (!ok) $('btn-mp-confirm').textContent = 'OCUPADO · ELIGE OTRO';
+    else $('btn-mp-confirm').textContent = '¡COLOR CONFIRMADO!';
   });
 
   // --- Free play: sin semáforo, sin cronometraje oficial ---
@@ -275,21 +286,30 @@ export function initMenus(game) {
         + '<span class="b-gap">' + (p.ready ? 'LISTO ✓' : '') + '</span></div>';
     }
     if (html !== lastPlayersHTML) { lastPlayersHTML = html; $('mp-players').innerHTML = html; }
-    // Turno de color
+    // Turno de color: elegir + CONFIRMAR (el turno solo pasa al confirmar)
     const me = MP.me();
     const myTurn = MP.myTurn();
     $('mp-turn-box').style.display = myTurn ? '' : 'none';
     if (myTurn && !$('mp-colors').hasChildNodes()) {
-      buildSwatches($('mp-colors'), CAR_COLORS, me?.color, (hex) => MP.pickColor(hex));
+      mpColorSel = null;
+      $('btn-mp-confirm').textContent = 'CONFIRMAR COLOR';
+      buildSwatches($('mp-colors'), CAR_COLORS, me?.color, (hex) => { mpColorSel = hex; $('btn-mp-confirm').textContent = 'CONFIRMAR ' + (CAR_COLORS.find((c) => c.hex === hex)?.name || 'COLOR').toUpperCase(); });
     }
     // Host tools
     $('mp-host-tools').style.display = MP.isHost && (meta.status === 'lobby') ? '' : 'none';
     $('btn-mp-launch').style.display = MP.isHost && meta.status === 'picking-done' && MP.allReady() ? '' : 'none';
-    // Botón LISTO
-    $('btn-mp-ready').style.display = meta.status === 'picking-done' ? '' : 'none';
-    if (me) $('btn-mp-ready').textContent = me.ready ? 'LISTO ✓' : 'LISTO';
+    // Botón LISTO: solo cuando TODOS los colores están elegidos
+    const pickingDone = meta.status === 'picking-done';
+    $('btn-mp-ready').style.display = pickingDone ? '' : 'none';
+    $('mp-ready-hint').style.display = pickingDone ? '' : 'none';
+    if (me) $('btn-mp-ready').textContent = me.ready ? 'LISTO ✓ (PULSA PARA QUITARLO)' : 'LISTO';
     // Cuando el host lanza la vuelta de reconocimiento, main.js toma el control
     if (meta.status === 'recon' && window.__mpStartRecon) window.__mpStartRecon(room);
+    // AUTO-LANZAMIENTO: si todos están listos, el host arranca solo (1.2 s)
+    // — nada de salas atascadas esperando un botón.
+    if (MP.isHost && pickingDone && MP.allReady()) {
+      if (!window.__mpAutoT) window.__mpAutoT = setTimeout(() => { window.__mpAutoT = null; if (MP.room?.meta?.status === 'picking-done') MP.startRecon(); }, 1200);
+    } else if (window.__mpAutoT) { clearTimeout(window.__mpAutoT); window.__mpAutoT = null; }
   };
 
 // Utilidades para que main.js gestione pantallas de estado

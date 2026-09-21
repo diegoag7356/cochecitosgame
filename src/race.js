@@ -56,9 +56,10 @@ export function isPlayerGhost() {
   return playerGhostUntil > performance.now();
 }
 
-// ---- OBB del coche (~4.6 x 1.9 m con alerones) + respuesta con impulso ----
-const CAR_HX = 0.95;
-const CAR_HZ = 2.3;
+// ---- OBB del coche (más pequeño que el visual: la carrocería es lo que
+// cuenta, no los alerones) + respuesta con impulso ----
+const CAR_HX = 0.58;   // semiancho  (hitbox 1.16 m — el visual con alerones es ~1.9)
+const CAR_HZ = 2.05;   // semilargo  (hitbox 4.10 m)
 
 function obbAxes(h) {
   return [
@@ -289,8 +290,39 @@ export class Race {
       const idx = Math.round((((targetU % 1) + 1) % 1) * n) % n;
       const curvSide = trk._turnSide[idx] || 0;
       // apex>0 tira hacia el interior de la curva que llega
-      const lineLat = -curvSide * 3.2 * br.apex;
+      let lineLat = -curvSide * 3.2 * br.apex;
       const wob = Math.sin(performance.now() / 1000 * br.wobF + br.wob) * 1.1;
+
+      // ---- NO EMBESTIR: mira coches delante (bots y jugador); si cierra
+      // sobre uno, frena a su ritmo y se desvía al lado libre ----
+      let follow = null;
+      const bfx = -Math.sin(b.heading), bfz = -Math.cos(b.heading);
+      const brx = Math.cos(b.heading), brz = -Math.sin(b.heading);
+      const others = player ? [player, ...this.bots] : this.bots;
+      for (const o of others) {
+        if (o === b) continue;
+        const isPl = o === player;
+        const dxo = o.pos.x - b.pos.x, dzo = o.pos.z - b.pos.z;
+        const dist = Math.hypot(dxo, dzo);
+        if (dist > 32 || dist < 0.1) continue;
+        const fwdD = dxo * bfx + dzo * bfz;       // proyección hacia delante
+        if (fwdD < 0.5) continue;                  // está detrás: no molesta
+        const latD = dxo * brx + dzo * brz;        // desplazamiento lateral
+        if (Math.abs(latD) > 2.6) continue;
+        const ov = isPl ? Math.max(o.vx || 0, 0) : Math.max(o.v, 0);
+        if (b.v <= ov + 0.5) continue;             // no voy a alcanzarlo
+        if (!follow || fwdD < follow.fwd) follow = { fwd: fwdD, lat: latD, v: ov };
+      }
+      let avoidCap = null;
+      if (follow) {
+        // Ritmo del de delante (con margen según distancia)
+        avoidCap = follow.v + Math.max(0, 7 - follow.fwd * 0.45);
+        // Si está encima, esquiva hacia el lado libre
+        if (follow.fwd < 15) {
+          const dodge = (follow.lat >= 0 ? -1 : 1) * 3.4 * (1 - follow.fwd / 15);
+          lineLat += dodge;
+        }
+      }
       const tp = trk.posAtArc(targetU, lineLat + wob);
 
       const dx = tp.x - b.pos.x, dz = tp.z - b.pos.z;
@@ -313,6 +345,8 @@ export class Race {
       // Control de lanzamiento: velocidad objetivo limitada durante los
       // primeros metros (arranque progresivo, como un humano)
       vTarget = Math.min(vTarget, 30 + 70 * launchFactor);
+      // NO EMBESTIR: nunca más rápido que el coche de delante cercano
+      if (avoidCap != null) vTarget = Math.min(vTarget, avoidCap);
       // Error HUMANO propio (no sincronizado): llega pasado y frena más
       b.brain.errPhase += dt * br.errRate;
       if (Math.sin(br.errPhase * 2.3) > 0.992 - this.profile.errP) vTarget *= 0.88;
@@ -417,6 +451,25 @@ export class Race {
     else if (touch) this.faults.penalty('touch', impact, rel);
   }
 
+  // Faltas de los BOTS: mismo baremo (amonestaciones, embestidas, DSQ).
+  // Se guardan POR BOT y se aplican a su tiempo final.
+  _faultForBot(bot, impact, frontality, rel) {
+    const nowMs = performance.now();
+    if (!this._botFaultCd) this._botFaultCd = {};
+    if (this._botFaultCd[bot.tag] > nowMs) return;
+    this._botFaultCd[bot.tag] = nowMs + 8000;
+    const frontal = frontality > 0.55 && rel > 6;
+    if (!frontal && rel < 0.8) return;
+    if (frontal && rel > 41) {
+      bot.dsq = true;                                // expulsión: DNF
+    } else if (frontal && (impact > 0.38 || rel > 14)) {
+      bot.penaltySec = (bot.penaltySec || 0) + 10;
+    } else {
+      bot.warnings = (bot.warnings || 0) + 1;
+      if (bot.warnings >= 3) { bot.warnings = 0; bot.penaltySec = (bot.penaltySec || 0) + 3; }
+    }
+  }
+
   _collisions(player, audio) {
     const now = performance.now();
     const ghost = playerGhostUntil > now;
@@ -432,6 +485,10 @@ export class Race {
         if (A.ghost || B.ghost) continue; // el fantasma no colisiona
         const dx0 = B.pos.x - A.pos.x, dz0 = B.pos.z - A.pos.z;
         if (dx0 * dx0 + dz0 * dz0 > 42) continue;
+        // COOLDOWN entre el mismo par de coches: evita re-impulsos cada frame
+        if (!this._hitCd) this._hitCd = {};
+        const ck = A.isPlayer ? 'p' + (B.tag || 'b') : (B.isPlayer ? 'p' + (A.tag || 'b') : (A.tag < B.tag ? A.tag + B.tag : B.tag + A.tag));
+        const cooling = this._hitCd[ck] > now;
         const candidates = obbOverlap(A.pos.x, A.pos.z, A.heading, B.pos.x, B.pos.z, B.heading);
         if (!candidates) continue;
         // SEPARACIÓN: por el eje de menor penetración (el más estable)
@@ -463,6 +520,8 @@ export class Race {
           if (relAx > 0.5 && (!best || c.depth > best.depth)) best = { nx, nz, depth: c.depth, rel: relAx };
         }
         if (!best) continue; // solo se rozan sin acercarse: nada de impulso
+        if (cooling) continue; // en cooldown: separación hecha, sin nuevo impulso
+        this._hitCd[ck] = now + 450; // 450 ms sin re-impulso para este par
         const hit = best;
         const depth = hit.depth;
         const rel = hit.rel;
@@ -498,15 +557,25 @@ export class Race {
           player.spinOmega = (player.spinOmega || 0) - pSpinSign * G * 5.0 * (0.35 + 0.65 * latP);
           if (typeof this.onPlayerHit === 'function') this.onPlayerHit(impact, hit);
           // La falta es SOLO de quien embiste (cierra más rápido hacia el otro)
+          // Velocidad de cierre de cada uno sobre la normal (n va de A a B):
+          // quien más cierra es quien embiste.
+          const closeA = vA * (fA[0] * hit.nx + fA[1] * hit.nz);
+          const closeB = -vB * (fB[0] * hit.nx + fB[1] * hit.nz);
+          const aRams = closeA >= closeB;
           if (A.isPlayer || B.isPlayer) {
-            // Velocidad de cierre de cada uno sobre la normal (n va de A a B):
-            // quien más cierra es quien embiste.
-            const closeA = vA * (fA[0] * hit.nx + fA[1] * hit.nz);
-            const closeB = -vB * (fB[0] * hit.nx + fB[1] * hit.nz);
-            const aRams = closeA >= closeB;
             const playerRams = (A.isPlayer && aRams) || (B.isPlayer && !aRams);
             const ramFrontality = aRams ? frontality : Math.abs(fB[0] * hit.nx + fB[1] * hit.nz);
             if (playerRams) this._faultForPlayer(impact, ramFrontality, rel);
+            else {
+              // El BOT embistió al jugador: falta para el bot
+              const rammerBot = A.isPlayer ? B : A;
+              this._faultForBot(rammerBot, impact, ramFrontality, rel);
+            }
+          } else {
+            // Bot vs Bot: faltas también para ellos
+            const rammer = aRams ? A : B;
+            const ramFrontality = aRams ? frontality : Math.abs(fB[0] * hit.nx + fB[1] * hit.nz);
+            this._faultForBot(rammer, impact, ramFrontality, rel);
           }
           if (audio && impact > 0.06) audio.crash(0.3 + impact);
         }
@@ -530,10 +599,11 @@ export class Race {
       { name: playerName, tag: this._tagOf(playerName), color: playerColor, prog: this.playerProgress.u, laps: playerLaps, total: playerLaps + this.playerProgress.u, isPlayer: true, finishTime: playerFinished ? (this.playerFinishTime || 0) : null, bestLap: this.playerBestLap || null },
     ];
     for (const b of this.bots) {
-      rows.push({ name: b.tag, tag: b.tag, color: b.color, prog: b.u, laps: b.lap, total: b.lap + b.u, isPlayer: false, finishTime: b.finishTime, bestLap: b.bestLap });
+      rows.push({ name: b.tag, tag: b.tag, color: b.color, prog: b.u, laps: b.lap, total: b.lap + b.u, isPlayer: false, finishTime: b.finishTime, bestLap: b.bestLap, pen: b.penaltySec || 0, dsq: !!b.dsq });
     }
     rows.sort((a, b) => {
-      if (a.finishTime != null && b.finishTime != null) return a.finishTime - b.finishTime;
+      if (a.dsq !== b.dsq) return a.dsq ? 1 : -1;          // DSQ al final
+      if (a.finishTime != null && b.finishTime != null) return (a.finishTime + a.pen * 1000) - (b.finishTime + b.pen * 1000);
       if (a.finishTime != null) return -1;
       if (b.finishTime != null) return 1;
       return b.total - a.total;

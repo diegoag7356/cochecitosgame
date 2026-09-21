@@ -9,7 +9,7 @@ import { initMenus, screens } from './menu.js';
 import { GameAudio } from './audio.js';
 import { Faults, setFaultListener } from './faults.js';
 import { setPlayerGhost, isPlayerGhost } from './race.js';
-import { Multiplayer } from './mp.js';
+import { Multiplayer, MP_PID } from './mp.js';
 import { setMultiplayer } from './menu.js';
 
 // ---- Multijugador (Firebase Realtime Database) ----
@@ -20,6 +20,7 @@ const MP = new Multiplayer((room) => {
   }
 });
 setMultiplayer(MP);
+window.__MP = MP; // depuración/testing
 
 const OVERLAY = document.getElementById('overlay');
 const HUD_SPEED = document.getElementById('hud-speed');
@@ -470,12 +471,14 @@ function defaultSession(mode) {
 window.__mpStartRecon = (room) => {
   if (session && session.mode === 'mp' && playing) return; // ya en marcha
   const ps = MP.playersSorted();
-  const me = ps.find((p) => p.id === MP_PID) || ps[0];
+  const meIdx = ps.findIndex((p) => p.id === MP_PID);
+  const me = meIdx >= 0 ? ps[meIdx] : ps[0];
   startSessionInternal({
     mode: 'mp',
     playerName: me ? me.name : 'PILOTO',
     playerColor: me ? me.color : '#e10600',
     laps: (room.meta && room.meta.laps) || 5,
+    mpSlot: meIdx >= 0 ? meIdx : 0,      // orden de unión = posición en la línea
     mp: { room: MP.roomId, players: ps },
   });
 };
@@ -617,7 +620,7 @@ function applyHudMode() {
 
 function showLights(on) {
   screens.lights(on);
-  if (on) {
+  if (on && race) {
     race.lights = 0;
     race.allOn = false;
     race.lightsT = 0;
@@ -694,28 +697,33 @@ function updateLapTimer() {
   const onRoad = Math.abs(inf.lat) < track.roadHalf + track.kerbW + 2;
   const racing = (session.mode === 'race' || session.mode === 'mp')
     && (!race || race.phase === 'green') && !session.disqualified;
-  // Vueltas de la vuelta de reconocimiento MP: la 1ª cruce cierra la vuelta
-  // clasificatoria y te asigna hueco de parrilla según orden de llegada.
-  if (session.mode === 'mp' && session.reconPhase === 'run' && fwd < 0.5 && prog < prev) {
+  // Vuelta de reconocimiento MP: al cruzar la LÍNEA AMARILLA (antes de la
+  // meta) se cierra la vuelta clasificatoria y te asignan hueco de parrilla
+  // por orden de llegada.
+  if (session.mode === 'mp' && session.reconPhase === 'run' && prog >= MP_YELLOW_U) {
     session.mpGridAssigned = session.mpGridAssigned < 0 ? mpGridCounter++ : session.mpGridAssigned;
     RACE_STATE.textContent = 'Sales en la Posición ' + (session.mpGridAssigned + 1);
     RACE_STATE.className = 'yellow';
     setStatusGrid(session.mpGridAssigned);
-    if (session.mpGridAssigned >= MP.playersSorted().length - 1) {
-      // Último en llegar: todos a parrilla → semáforo
-      session.reconPhase = 'grid';
-      session.gridWait = 3;
-      startRaceLights();
+  }
+  // Transición a parrilla: cuando TODOS tienen hueco (host o cliente lo ven
+  // por la sala), 3 s de espera y semáforo. Los huecos viven en room/grid.
+  if (session.mode === 'mp' && session.reconPhase === 'run' && session.mpGridAssigned >= 0) {
+    const gridMap = (MP.room && MP.room.grid) || {};
+    const allSet = MP.playersSorted().length > 0 && MP.playersSorted().every((p) => gridMap[p.id] != null);
+    if (allSet && !session._gridArming) {
+      session._gridArming = true;
+      setTimeout(() => {
+        if (!session || session.mode !== 'mp' || session.reconPhase !== 'run') return;
+        session.reconPhase = 'grid';
+        session.gridWait = 3;
+        startRaceLights();
+        if (MP.isHost) MP.setStatus('racing');
+      }, 3000);
     }
   }
-  // Cuenta atrás 3-2-1 del reconocimiento
-  if (session.mode === 'mp' && session.reconPhase === 'count') {
-    session.reconT -= (now - session.t0) / 1000;
-    session.t0 = now;
-    const n = Math.ceil(session.reconT);
-    RACE_STATE.textContent = n > 0 ? String(n) : '¡SALIDA!';
-    if (session.reconT <= 0) { session.reconPhase = 'run'; session.clockOn = true; timer.t0 = now; }
-  }
+  // NOTA: la cuenta atrás 3-2-1 del reconocimiento se gestiona en tick()
+  // (aquí se descontaba DOS veces y salía al doble de rápido).
   lastLapProg = prog;
 
   // ---- Sectores FÍSICOS: marcas a 1/3 y 2/3 de vuelta, solo hacia delante ----
@@ -813,8 +821,20 @@ const ttLaps = [];    // tiempos de cada vuelta válida
 
 // ---- Multijugador en pista ----
 let mpGridCounter = 0; // orden de llegada a la línea amarilla
+const MP_YELLOW_U = 0.985; // línea amarilla ≈ 60 m antes de la meta
 async function setStatusGrid(slot) {
   try { await MP.setGridSlot(slot); } catch (_) {}
+}
+// Coloca a MI coche en mi hueco de parrilla ganado en la clasificatoria
+function placeMpAtGrid(slot) {
+  const slots = track.gridSlots || [];
+  const s = slots[Math.min(slot, slots.length - 1)] || { pos: track.startPos, heading: track.startHeading };
+  drive.pos.copy(s.pos);
+  drive.heading = s.heading;
+  drive.vx = drive.steer = drive.omega = 0;
+  drive.drs = false;
+  car.position.copy(drive.pos);
+  car.rotation.y = drive.heading;
 }
 // Semáforo MP: máquina de estados propia (independiente del Race local)
 let mpLights = null;
@@ -1034,12 +1054,15 @@ function physicsStep(dt) {
   const maxLat = (P.latBase + P.latQ * vAbs * vAbs) * grip;
   const gripOmega = (Math.sign(steerOmega) * maxLat) / Math.max(vAbs, 0.1);
   st.omega = Math.abs(steerOmega) > Math.abs(gripOmega) ? gripOmega : steerOmega;
-  // TROMPO: los impactos añaden rotación extra que se disipa en ~1 s
+  // TROMPO: los impactos añaden rotación extra que se disipa en ~0.7 s.
+  // CAP duro para que un toque NUNCA deje el coche incontrolable.
   if (st.spinOmega) {
     st.omega += st.spinOmega;
-    st.spinOmega *= Math.exp(-3 * dt);
+    st.spinOmega *= Math.exp(-4.2 * dt);
     if (Math.abs(st.spinOmega) < 0.02) st.spinOmega = 0;
+    st.spinOmega = THREE.MathUtils.clamp(st.spinOmega, -2.6, 2.6);
   }
+  st.omega = THREE.MathUtils.clamp(st.omega, -3.4, 3.4);
 
   st.heading += st.omega * dt;
   const fwdX = -Math.sin(st.heading), fwdZ = -Math.cos(st.heading);
@@ -1532,9 +1555,12 @@ function tick(now) {
           updateMpLights(dt);
         }
       } else if (session.reconPhase === 'grid') {
-        // En parrilla: colisiones activas de nuevo + faltas activas
-        if (race) race.noCollisions = false;
-        if (FAULTS) FAULTS.enabled = true;
+        // En parrilla: colisiones activas de nuevo + faltas activas.
+        // Teleport a tu hueco UNA vez (así todos salen del hueco que ganaron).
+        if (!session._gridPlaced) {
+          session._gridPlaced = true;
+          placeMpAtGrid(session.mpGridAssigned);
+        }
         updateMpLights(dt);
       }
     } else if (session && session.mode === 'race' && race) {
@@ -1567,12 +1593,25 @@ function tick(now) {
     AUDIO.updateEngine(0, 0, false);
   }
 
-  updateNoseCamera(now / 1000);
-  updateHUD();
-  renderer.render(scene, camera);
-  updateRearView();
+  // OPTIMIZACIÓN MENÚ: si hay una pantalla de menú abierta y no estamos
+  // jugando, NO renderizamos la escena 3D ni el HUD (ahorra la GPU entera).
+  if (playing) {
+    updateNoseCamera(now / 1000);
+    updateHUD();
+    renderer.render(scene, camera);
+    updateRearView();
+  } else if (menuDirty) {
+    // Primer frame tras abrir un menú: un único render (fondo vivo detrás)
+    updateNoseCamera(now / 1000);
+    renderer.render(scene, camera);
+    updateRearView();
+    menuDirty = false;
+  }
   requestAnimationFrame(tick);
 }
+let menuDirty = true;
+const _menuObserver = new MutationObserver(() => { menuDirty = true; });
+for (const s of document.querySelectorAll('.screen')) _menuObserver.observe(s, { attributes: true, attributeFilter: ['class'] });
 requestAnimationFrame(tick);
 
 window.addEventListener('resize', () => {
