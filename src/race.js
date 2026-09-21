@@ -31,6 +31,9 @@ const PROFILES = {
   easy:   { corner: 0.85, drs: false, errP: 0.020, defend: 0.1 },
   medium: { corner: 0.95, drs: false, errP: 0.008, defend: 0.4 },
   hard:   { corner: 1.00, drs: true,  errP: 0.003, defend: 0.8 },
+  // ONLINE (NPC): campo nivelado — mismos reflejos para todos, sin DRS,
+  // errores mínimos y sin jugadas defensivas. Tu DRS es libre en zona.
+  online: { corner: 0.95, drs: false, errP: 0.004, defend: 0.0 },
 };
 
 // Nombres INVENTADOS (nada de pilotos/competiciones reales)

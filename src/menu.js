@@ -206,6 +206,31 @@ export function initMenus(game) {
     });
   });
 
+  // --- Online (NPC): carrera "online" de práctica con rivales NPC nivelados ---
+  const online = { name: cookieName(), color: cookieColor(), laps: 5 };
+  $('btn-online').addEventListener('click', () => {
+    online.name = cookieName();
+    $('online-name').value = online.name;
+    buildSwatches($('online-colors'), CAR_COLORS, online.color, (hex) => { online.color = hex; setCookie('f1_color', hex); });
+    $('online-laps').textContent = online.laps;
+    onlyScreen('screen-online');
+  });
+  $('btn-online-back').addEventListener('click', () => onlyScreen('screen-modes'));
+  $('online-minus').addEventListener('click', () => { online.laps = Math.max(3, online.laps - 1); $('online-laps').textContent = online.laps; });
+  $('online-plus').addEventListener('click', () => { online.laps = Math.min(20, online.laps + 1); $('online-laps').textContent = online.laps; });
+  $('online-name').addEventListener('input', (e) => {
+    online.name = e.target.value.toUpperCase().replace(/[^A-Z0-9 _-]/g, '').slice(0, 12);
+    e.target.value = online.name;
+    setCookie('f1_name', online.name);
+  });
+  $('btn-online-start').addEventListener('click', () => {
+    if (!online.name.trim()) { $('online-name').focus(); return; }
+    setCookie('f1_name', online.name);
+    game.startSession({
+      mode: 'online', playerName: online.name.trim(), playerColor: online.color, laps: online.laps,
+    });
+  });
+
   // --- Ajustes de pausa (volumen + sensibilidad) ---
   const opts = {
     volume: parseFloat(getCookie('f1_volume') || '0.7'),

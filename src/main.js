@@ -51,6 +51,8 @@ const HUD_DMG = document.getElementById('dmg-chip');
 const POS_BIG_P = document.getElementById('pos-big-p');
 const POS_BIG_L = document.getElementById('pos-big-l');
 const BOARD_MODE = document.getElementById('board-mode');
+const GAP_CHIP = document.getElementById('gap-chip');
+const GAP_VAL = document.getElementById('gap-val');
 const SCALE = 0.02; // unidades obj -> mundo
 
 let playing = false;
@@ -365,7 +367,12 @@ window.addEventListener('keydown', (e) => {
   }
   if (!playing || paused) return;
   if (e.code === 'KeyC') { e.preventDefault(); cycleCamera(); return; }
-  if (e.code === 'KeyR') { e.preventDefault(); restartSession(); return; }
+  if (e.code === 'KeyR') {
+    e.preventDefault();
+    // ONLINE: sin reinicio instantáneo (haría trampas). Usa el menú de pausa.
+    if (session && session.mode === 'mp') return;
+    restartSession(); return;
+  }
   if (e.code === 'KeyT') { e.preventDefault(); recoverToTrack(); return; }
   if (e.code === 'Space') {
     e.preventDefault();
@@ -505,6 +512,14 @@ initMenus({
       session.drsRule = 'within1s';
       session.countdown = true;
     }
+    if (cfg.mode === 'online') {
+      // ONLINE (NPC): campo nivelado, DRS libre en zona (los NPC no lo usan)
+      session.laps = cfg.laps || 5;
+      session.drsEnabled = true;
+      session.drsRule = 'free';
+      session.countdown = true;
+      session.difficulty = 'online'; // perfil NPC nivelado de race.js
+    }
     beginSession();
   },
   resume() { resumeGame(); },
@@ -556,7 +571,7 @@ function beginSession() {
   timer.last = null;
   // El reloj corre desde el inicio de la sesión, EXCEPTO en carrera: allí
   // empieza exactamente al apagarse las luces (updateRaceFlow).
-  timer.running = session.mode !== 'race' && session.mode !== 'mp';
+  timer.running = session.mode !== 'race' && session.mode !== 'online' && session.mode !== 'mp';
   timer.t0 = performance.now();
   timer.prevSide = 0;
   lapDoneCount = 0;    if (session.mode === 'mp') {
@@ -566,7 +581,7 @@ function beginSession() {
       session.best = null; session.last = null;
       lapCounter.laps = 0;
       session.reconPhase = 'count';
-      session.reconT = 3.2;            // cuenta atrás 3-2-1
+      session.reconT = 3.0;            // cuenta atrás 3-2-1
       session.reconDone = false;
       session.lapInvalid = false;
       session.mpGridAssigned = -1;
@@ -576,7 +591,7 @@ function beginSession() {
       AUDIO.countdown();
       FAULTS = new Faults(session, track);
       FAULTS.enabled = false;          // en la vuelta de reconocimiento no hay faltas
-    } else if (session.mode === 'race') {
+    } else if (session.mode === 'race' || session.mode === 'online') {
     // El reloj NO arranca en la parrilla: empieza exactamente al apagarse
     // las luces (updateRaceFlow se encarga).
     session.t0 = performance.now();
@@ -696,7 +711,7 @@ function updateLapTimer() {
   const bwd = ((prev - prog) % 1 + 1) % 1; // retroceso
   const inf = track.info(drive.pos.x, drive.pos.z);
   const onRoad = Math.abs(inf.lat) < track.roadHalf + track.kerbW + 2;
-  const racing = (session.mode === 'race' || session.mode === 'mp')
+  const racing = (session.mode === 'race' || session.mode === 'online' || session.mode === 'mp')
     && (!race || race.phase === 'green') && !session.disqualified;
   // Vuelta de reconocimiento MP: al cruzar la LÍNEA AMARILLA (antes de la
   // meta) se cierra la vuelta clasificatoria y te asignan hueco de parrilla
@@ -744,7 +759,7 @@ function updateLapTimer() {
   // ---- Línea de META: en carrera el primer cruce (desde la parrilla) ARMA
   // la vuelta sin registrar tiempo falso; los siguientes cierran vueltas. ----
   if (fwd < 0.5 && prog < prev) {
-    const armaVuelta = session.mode === 'race' && lapCounter.laps === 0 && !lapCounter.armed;
+    const armaVuelta = (session.mode === 'race' || session.mode === 'online') && lapCounter.laps === 0 && !lapCounter.armed;
     if (armaVuelta) {
       // Primer cruce tras la salida: ARMA la vuelta (no registra tiempo falso
       // de los ~2 s desde la parrilla). El cronómetro de vuelta reinicia aquí:
@@ -761,8 +776,17 @@ function updateLapTimer() {
       timer.last = t;
       if (valido) {
         if (session.best == null || t < session.best) {
+          const wasBest = session.best != null; // null = primera vuelta: sin fanfarria
           session.best = t;
           AUDIO.fastLap();
+          // Flash de vuelta rápida estilo F1 TV: verde (mejora personal) /
+          // morado (vuelta rápida de sesión)
+          HUD_TIME.classList.remove('best-lap');
+          void HUD_TIME.offsetWidth; // reinicia la animación
+          HUD_TIME.textContent = fmtTime(t);
+          HUD_TIME.classList.add('best-lap');
+          HUD_TIME.style.setProperty('--bl-color', wasBest ? 'var(--accent-purple)' : 'var(--accent-green)');
+          setTimeout(() => HUD_TIME.classList.remove('best-lap'), 1400);
         }
         if (timer.best == null || t < timer.best) timer.best = t;
         // Sector 3 de la vuelta que cierra
@@ -777,7 +801,7 @@ function updateLapTimer() {
           }
         }
         // Carrera: meta final tras completar las vueltas configuradas
-        if (session.mode === 'race' && !session.finished && lapCounter.laps >= session.laps) {
+        if ((session.mode === 'race' || session.mode === 'online') && !session.finished && lapCounter.laps >= session.laps) {
           session.finished = true;
           session.finishTime = now;
           if (race) race.finishPlayer(now);
@@ -785,7 +809,7 @@ function updateLapTimer() {
           RACE_STATE.className = 'green';
         }
       }
-      if (session.mode === 'race') lapCounter.laps++;
+      if ((session.mode === 'race' || session.mode === 'online')) lapCounter.laps++;
     }
     // NUEVA vuelta: el cronómetro SIEMPRE sigue contando (no se para nunca).
     // Marca el inicio de la vuelta: el HUD muestra tiempo de VUELTA.
@@ -817,7 +841,7 @@ function sectorComplete(n, now) {
   if (isBest) session.bestSectors[n] = t;
   SECTOR_NAME.textContent = 'SECTOR ' + n;
   SECTOR_TIME.textContent = fmtTime(t).replace(/^0:/, '');
-  SECTOR_TIME.style.color = isBest ? '#b455ff' : '#ffd23d';
+  SECTOR_TIME.classList.toggle('best', !!isBest);
   AUDIO.sectorFestival(isBest);
   SECTOR_FLASH.classList.add('show');
   clearTimeout(sectorFlashTO);
@@ -955,7 +979,7 @@ let sectorDone = {};
 // ============================================================
 function placeAtStart() {
   let pos = track.startPos, heading = track.startHeading;
-  if (session && session.mode === 'race' && race) {
+  if (session && (session.mode === 'race' || session.mode === 'online') && race) {
     pos = race.playerStart.pos; heading = race.playerStart.heading;
   }
   // MP: salida escalonada por orden de unión, colocada POR ARCO EXACTO
@@ -1085,7 +1109,7 @@ function physicsStep(dt) {
 
   st.aLat = Math.abs(st.omega * st.vx) / 9.81;
   // Faltas: atajos (4 ruedas fuera con ganancia de progreso)
-  if (FAULTS && session && session.mode === 'race') {
+  if (FAULTS && session && (session.mode === 'race' || session.mode === 'online')) {
     FAULTS.trackCut(st.pos.x, st.pos.z, offTrack && !inSand, vAbs, performance.now());
   }
 }
@@ -1270,9 +1294,23 @@ function updateHUD() {
   HUD_TIME.classList.toggle('invalid', !!(session && session.lapInvalid));
   HUD_LAST.textContent = fmtTime(session ? session.last : timer.last);
   HUD_BEST.textContent = fmtTime(session && session.best != null ? session.best : timer.best);
+  // Chip de intervalo grande (VS DELANTERO): cuánto te saca el coche de delante
+  if (race && (session.mode === 'race' || session.mode === 'online') && race.phase === 'green') {
+    const rows = race.lastStandings || [];
+    const myIdx = rows.findIndex((r) => r.isPlayer);
+    if (myIdx > 0) {
+      const d = track.lapDist(rows[myIdx].prog, rows[myIdx - 1].prog); // hacia DELANTE hasta el de delante
+      GAP_VAL.textContent = '+' + (d / 80).toFixed(1) + 's';
+    } else {
+      GAP_VAL.textContent = 'LÍDER';
+    }
+    GAP_CHIP.classList.add('on');
+  } else {
+    GAP_CHIP.classList.remove('on');
+  }
   if (session && session.mode === 'timetrial') {
     HUD_LAPCOUNT.textContent = 'VUELTA ' + Math.min(lapDoneCount + 1, session.laps) + '/' + session.laps;
-  } else if (session && session.mode === 'race') {
+  } else if (session && (session.mode === 'race' || session.mode === 'online')) {
     // La carrera SIEMPRE empieza en la vuelta 1 (el cruce de meta cierra la 1ª)
     HUD_LAPCOUNT.textContent = 'VUELTA ' + Math.min(Math.max(lapCounter.laps, 1), session.laps) + '/' + session.laps;
   } else if (session && session.mode === 'free') {
@@ -1287,7 +1325,7 @@ function updateHUD() {
   if (dmgSpan) dmgSpan.textContent = Math.round(playerDmg * 100) + '%';
 
   // Posición grande (P#) + intervalo con el de delante
-  if (race && session.mode === 'race') {
+  if (race && (session.mode === 'race' || session.mode === 'online')) {
     const rows = race.lastStandings || [];
     const myIdx = Math.max(0, rows.findIndex((r) => r.isPlayer));
     POS_BIG_P.textContent = 'P' + (myIdx + 1);
@@ -1364,7 +1402,7 @@ function updateBoard() {
 // Carrera: flujo de salida y final
 // ============================================================
 function updateRaceFlow(dt) {
-  if (!race || !session || session.mode !== 'race') return;
+  if (!race || !session || (session.mode !== 'race' && session.mode !== 'online')) return;
   if (race.phase === 'countdown') {
     race.updateLights(dt);
     // Bombillas: fila horizontal de 5 (la columna i se enciende al llegar a i+1 luces)
@@ -1553,7 +1591,8 @@ function tick(now) {
         // Cuenta atrás 3-2-1 en PANTALLA GRANDE (no depende del leaderboard)
         RACE_STATE.className = 'yellow countdown';
         document.body.classList.add('race-countdown');
-        const n = Math.ceil(session.reconT);
+        session.reconT -= dt;                      // FIX: antes NUNCA se decrementaba
+        const n = Math.min(3, Math.ceil(session.reconT)); // FIX: 3.2 daba un "4"
         const txt = n > 0 ? String(n) : '¡SALIDA!';
         if (RACE_STATE.textContent !== txt) {
           RACE_STATE.textContent = txt;
@@ -1572,6 +1611,7 @@ function tick(now) {
       } else if (session.reconPhase === 'run') {
         // Vuelta de posiciones: SIN colisiones entre jugadores (como pediste)
         noMpCollisions = true;
+        document.body.classList.remove('race-countdown');
         if (session.mpGridAssigned >= 0) {
           updateMpLights(dt);
         }
@@ -1585,7 +1625,7 @@ function tick(now) {
         noMpCollisions = false;
         updateMpLights(dt);
       }
-    } else if (session && session.mode === 'race' && race) {
+    } else if (session && (session.mode === 'race' || session.mode === 'online') && race) {
       updateRaceFlow(dt);
       // La física sigue SIEMPRE activa (el flujo congela el coche en
       // countdown); los bots corren desde el apagado, incluso tras tu meta.
