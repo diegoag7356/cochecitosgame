@@ -317,8 +317,9 @@ export class Race {
       if (follow) {
         // Ritmo del de delante (con margen según distancia)
         avoidCap = follow.v + Math.max(0, 7 - follow.fwd * 0.45);
-        // Si está encima, esquiva hacia el lado libre
-        if (follow.fwd < 15) {
+        // Si está encima y aún hay tiempo, esquiva hacia el lado libre
+        // (demasiado cerca: ya solo frena, esquivar ahí causa roces).
+        if (follow.fwd < 15 && follow.fwd > 6) {
           const dodge = (follow.lat >= 0 ? -1 : 1) * 3.4 * (1 - follow.fwd / 15);
           lineLat += dodge;
         }
@@ -534,7 +535,10 @@ export class Race {
           const G = THREE.MathUtils.clamp(impact * 2.2, 0.15, 1);
 
           if (!A.isPlayer) {
-            A.v = Math.max(0, A.v - jImp * Math.abs(fA[0] * hit.nx + fA[1] * hit.nz));
+            // El impulso se proyecta sobre el morro de A: si A embiste
+            // (fA·n > 0) frena; si A es embestido (fA·n < 0) gana velocidad.
+            const dvA = -jImp * (fA[0] * hit.nx + fA[1] * hit.nz);
+            A.v = Math.max(0, A.v + dvA);
             // TROMPO REAL: el golpe añade velocidad angular que el bot recupera
             const spinSign = (hit.nz * fA[0] - hit.nx * fA[1]) > 0 ? 1 : -1;
             A.spinOmega = (A.spinOmega || 0) + spinSign * G * 4.5 * (0.3 + 0.7 * (1 - frontality));
@@ -542,20 +546,26 @@ export class Race {
             A.vLossPerm = Math.min(6, A.vLossPerm + impact * 0.8);
           }
           if (!B.isPlayer) {
-            B.v = Math.max(0, B.v - jImp * Math.abs(fB[0] * hit.nx + fB[1] * hit.nz));
+            const dvB = jImp * (fB[0] * hit.nx + fB[1] * hit.nz);
+            B.v = Math.max(0, B.v + dvB);
             const spinSign = (hit.nz * fB[0] - hit.nx * fB[1]) > 0 ? 1 : -1;
             B.spinOmega = (B.spinOmega || 0) + spinSign * G * 4.5 * (0.3 + 0.7 * (1 - frontality));
             B.dmgFront = Math.min(1, B.dmgFront + impact * 0.5);
             B.vLossPerm = Math.min(6, B.vLossPerm + impact * 0.8);
           }
-          // El jugador: pierde velocidad + TROMPO (velocidad angular que
-          // integra la física: el coche gira de verdad y se recupera)
-          const latP = 1 - frontality;
-          player.vx = Math.max(0, (player.vx || 0) - jImp * (0.6 + latP * 0.6));
-          const fP = { x: -Math.sin(player.heading), z: -Math.cos(player.heading) };
-          const pSpinSign = (hit.nz * fP.x - hit.nx * fP.z) > 0 ? 1 : -1;
-          player.spinOmega = (player.spinOmega || 0) - pSpinSign * G * 5.0 * (0.35 + 0.65 * latP);
-          if (typeof this.onPlayerHit === 'function') this.onPlayerHit(impact, hit);
+          // El jugador: MISMA regla — el impulso se proyecta sobre su morro.
+          // (Antes siempre se le restaba velocidad, incluso cuando te
+          // embistieran por detrás: por eso el coche hacia cosas raras.)
+          {
+            const latP = 1 - frontality;
+            const fP = { x: -Math.sin(player.heading), z: -Math.cos(player.heading) };
+            const dvP = (A.isPlayer ? -jImp : jImp)
+              * (A.isPlayer ? (fA[0] * hit.nx + fA[1] * hit.nz) : (fB[0] * hit.nx + fB[1] * hit.nz));
+            player.vx = Math.max(-12, player.vx + dvP);
+            const pSpinSign = (hit.nz * fP.x - hit.nx * fP.z) > 0 ? 1 : -1;
+            player.spinOmega = (player.spinOmega || 0) - pSpinSign * G * 5.0 * (0.35 + 0.65 * latP);
+            if (typeof this.onPlayerHit === 'function') this.onPlayerHit(impact, hit);
+          }
           // La falta es SOLO de quien embiste (cierra más rápido hacia el otro)
           // Velocidad de cierre de cada uno sobre la normal (n va de A a B):
           // quien más cierra es quien embiste.

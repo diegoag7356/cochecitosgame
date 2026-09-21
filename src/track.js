@@ -80,6 +80,7 @@ export class Track {
     this.buildCurbs();
     this.buildStartLine();
     this.buildGrid();
+    this.buildYellowLine();
     this.buildSand();
     this.buildBarrier();
     this.buildBuildings();
@@ -277,6 +278,7 @@ export class Track {
     }
     const p = C[i12 % n], ahead = C[(i12 + 10) % n];
     this.startPos = new THREE.Vector3(p.x, 0, p.z);
+    this.startFrac = (i12 % n) / n;   // arco (u) de la línea de meta
     const dir = new THREE.Vector3(ahead.x - p.x, 0, ahead.z - p.z).normalize();
     this.startHeading = Math.atan2(-dir.x, -dir.z);
     this.startTangent = dir;
@@ -803,6 +805,57 @@ export class Track {
     this.rightCurb = buildSide(-1);
     this.scene.add(this.leftCurb);
     this.scene.add(this.rightCurb);
+  }
+
+  // Línea AMARILLA de clasificación MP: quad pintado sobre el asfalto que
+  // sigue la CURVA de la pista (no se corta en esquinas), se desvanece en
+  // los bordes y devuelve su posición de arco (u) para la lógica.
+  buildYellowLine() {
+    const C = this.centers, n = C.length;
+    // Punto central a ~80 m DETRÁS de la meta (ANTES de la parrilla: el
+    // último hueco está a −64 m), anclado al ÍNDICE DE META (no al índice 0).
+    const backIdx = Math.round((80 / this.trackLen()) * n);
+    const iStart = Math.round(this.startFrac * n) % n;
+    const iC = (iStart - backIdx + n) % n;
+    // LÍNEA TRANSVERSAL: como la de meta, cruza el asfalto de borde a borde.
+    // Si la pista está curvada en ese punto, son dos mitades con normales
+    // propias — nunca se corta ni se queda corta.
+    const c = C[iC];
+    const ca = C[(iC + 4) % n], cb = C[(iC - 4 + n) % n];
+    let dx = ca.x - cb.x, dz = ca.z - cb.z;
+    let dl = Math.hypot(dx, dz) || 1;
+    const tg = { x: dx / dl, z: dz / dl };
+    const nl = { x: -tg.z, z: tg.x };
+    const half = this.roadHalf + 0.3;
+    const y = 0.035, W = 0.45;
+    // Punto de borde a cada lado (siguiendo la dirección de la pista)
+    const edgePos = (s) => ({ x: c.x + nl.x * s * half, z: c.z + nl.z * s * half });
+    const L = edgePos(-1), R = edgePos(1);
+    const vts = [
+      [L.x, y, L.z], [L.x + tg.x * W, y, L.z + tg.z * W],
+      [R.x, y, R.z], [R.x + tg.x * W, y, R.z + tg.z * W],
+    ];
+    const verts = [], col = [], idx = [];
+    for (const v of vts) { verts.push(v[0], v[1], v[2]); col.push(1, 0.83, 0.05); }
+    idx.push(0, 1, 2, 2, 1, 3);
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+    geometry.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    geometry.setIndex(idx);
+    geometry.computeVertexNormals();
+    const mat = new THREE.MeshBasicMaterial({
+      vertexColors: true, transparent: true, opacity: 0.92,
+      depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2,
+    });
+    if (this.yellowLine) this.scene.remove(this.yellowLine);
+    this.yellowLine = new THREE.Mesh(geometry, mat);
+    this.yellowLine.renderOrder = 2;
+    this.scene.add(this.yellowLine);
+    // u de la línea (para la lógica de clasificación MP), relativa a la meta
+    let u = ((iC / n) - this.startFrac) % 1;
+    if (u < 0) u += 1;
+    this.yellowU = u;
+    return this.yellowU;
   }
 
   // Línea de meta a cuadros, en la recta de meta (donde arranca el coche)

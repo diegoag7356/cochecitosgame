@@ -699,7 +699,8 @@ function updateLapTimer() {
     && (!race || race.phase === 'green') && !session.disqualified;
   // Vuelta de reconocimiento MP: al cruzar la LÍNEA AMARILLA (antes de la
   // meta) se cierra la vuelta clasificatoria y te asignan hueco de parrilla
-  // por orden de llegada.
+  // por orden de llegada. La posición de la línea la fija la propia pista.
+  const MP_YELLOW_U = track.yellowU != null ? track.yellowU : 0.985;
   if (session.mode === 'mp' && session.reconPhase === 'run' && prog >= MP_YELLOW_U) {
     session.mpGridAssigned = session.mpGridAssigned < 0 ? mpGridCounter++ : session.mpGridAssigned;
     RACE_STATE.textContent = 'Sales en la Posición ' + (session.mpGridAssigned + 1);
@@ -821,7 +822,6 @@ const ttLaps = [];    // tiempos de cada vuelta válida
 
 // ---- Multijugador en pista ----
 let mpGridCounter = 0; // orden de llegada a la línea amarilla
-const MP_YELLOW_U = 0.985; // línea amarilla ≈ 60 m antes de la meta
 async function setStatusGrid(slot) {
   try { await MP.setGridSlot(slot); } catch (_) {}
 }
@@ -921,22 +921,8 @@ function updateMpRemote(dt) {
     if (!seen.has(idg)) { scene.remove(g); mpMeshes.delete(idg); }
   }
 }
-// Línea amarilla de clasificación MP: dibujada a 40 m de la parrilla (antes
-// de la meta) cruzando todo el asfalto.
-function buildMpYellowLine() {
-  const p = track.startPos, tg = track.startTangent;
-  const nlx = -tg.z, nlz = tg.x;
-  const back = 8 + 8 * 8 + 20; // detrás de los 8 huecos + margen
-  const x1 = p.x - tg.x * back - nlx * (track.roadHalf + 1);
-  const z1 = p.z - tg.z * back - nlz * (track.roadHalf + 1);
-  const x2 = p.x - tg.x * back + nlx * (track.roadHalf + 1);
-  const z2 = p.z - tg.z * back + nlz * (track.roadHalf + 1);
-  const g = new THREE.BufferGeometry().setFromPoints([
-    new THREE.Vector3(x1, 0.03, z1), new THREE.Vector3(x2, 0.03, z2),
-  ]);
-  track.scene.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0xffd400 })));
-}
-buildMpYellowLine();
+// Línea amarilla de clasificación MP: la construye track.buildYellowLine()
+// (quad sobre el asfalto que sigue la curva de la pista, no se corta).
 let sectorStart = 0, currentSector = 1, sectorFlashTO = null;
 let sectorDone = {};
 
@@ -1055,12 +1041,13 @@ function physicsStep(dt) {
   const gripOmega = (Math.sign(steerOmega) * maxLat) / Math.max(vAbs, 0.1);
   st.omega = Math.abs(steerOmega) > Math.abs(gripOmega) ? gripOmega : steerOmega;
   // TROMPO: los impactos añaden rotación extra que se disipa en ~0.7 s.
-  // CAP duro para que un toque NUNCA deje el coche incontrolable.
+  // El CAP se aplica ANTES de integrar (si no, el frame del impulso se
+  // escapaba y el coche daba un tirón de giro imposible de controlar).
   if (st.spinOmega) {
+    st.spinOmega = THREE.MathUtils.clamp(st.spinOmega, -2.2, 2.2);
     st.omega += st.spinOmega;
     st.spinOmega *= Math.exp(-4.2 * dt);
     if (Math.abs(st.spinOmega) < 0.02) st.spinOmega = 0;
-    st.spinOmega = THREE.MathUtils.clamp(st.spinOmega, -2.6, 2.6);
   }
   st.omega = THREE.MathUtils.clamp(st.omega, -3.4, 3.4);
 
